@@ -54,5 +54,10 @@ jobs:
           fi
           printf '%s\n' "$PHASE2_ENV_FILE" > .env.phase2
 
+      # Assert on-chain fixture preconditions (code exists, policy active, agent/token balances)
+      # Fails fast with clear redeployment instructions if the testnet fixture has expired or been drained.
+      - name: verify fixture preconditions
+        run: node scripts/check-fixture-preconditions.ts
+
       - name: run the live testnet suite
         run: npm run test:integration
