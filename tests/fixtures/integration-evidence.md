@@ -159,3 +159,27 @@ transfers returned 6 of 6 allowed with no waits.
 This is worth stating plainly rather than burying: it is a client-side resource
 pricing issue, not a guard defect, and it did not let any transaction through that
 policy forbade.
+
+## Pre-flight cache validation (2026-09-25)
+
+The opt-in cache behavior is covered without network access in
+`tests/unit/preflight.test.ts` using a mocked RPC and the real
+probe/enforced-simulation path. The tests verify default opt-out, cache hits,
+ledger-based configuration, TTL expiry, full and call-specific invalidation,
+ledger advance invalidation, policy-revision invalidation, argument-sensitive
+keys, and non-caching of transient undetermined results.
+
+Local checks completed successfully:
+
+```text
+npm run typecheck
+npm run lint
+npm test                 # 89 passing unit tests
+npm run build
+```
+
+A fresh live-testnet run was not claimed for this change: `.env.phase2` is
+absent from this checkout, and the available runtime is Node 22 while the
+package requires Node 24 for the documented live workflow. The cache tests are
+fully mocked and reproducible without credentials; a maintainer can rerun the
+live suite with the repository's documented testnet credentials before merge.
