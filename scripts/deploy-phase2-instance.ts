@@ -39,6 +39,7 @@ import {
 import { invoke } from "../src/invoke.ts";
 import { policyToScVal, type PolicyConfig } from "../src/policy.ts";
 import { summarizeDiagnosticEvents } from "../src/tx.ts";
+import { assertFixtureSchema } from "../tests/integration/harness.ts";
 import { json, parseArgs, verifyWasmIdentity } from "./inspect-deployment.ts";
 
 /** The Phase 1 artifact — the same bytes must be deployed for Phase 2. */
@@ -809,6 +810,7 @@ async function main(): Promise<void> {
     runs,
   };
 
+  assertFixtureSchema(fixtures);
   await mkdir(dirname(FIXTURES_PATH), { recursive: true });
   await writeFile(FIXTURES_PATH, `${json(fixtures)}\n`);
   await writeEnv(keys, { guard, token }, rpcUrl);
