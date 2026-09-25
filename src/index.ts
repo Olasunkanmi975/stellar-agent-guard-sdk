@@ -64,8 +64,11 @@ export {
   PreFlightInterceptor,
   PreFlightUndeterminedError,
   preflight,
+  type PolicyRevision,
+  type PreFlightCacheOptions,
   type PreFlightConfig,
   type PreFlightDecision,
+  type PreFlightInterceptorOptions,
 } from "./preflight.ts";
 
 export {

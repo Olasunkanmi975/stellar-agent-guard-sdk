@@ -20,3 +20,16 @@ Stellar Agent Guard provides zero-cost pre-flight interception:
 | `admissible` | Approved by guard policy | Proceed to broadcast |
 | `blocked` | Explicitly denied by policy | Reject tool call; 0 network fees charged |
 | `undetermined` | Simulation failed or network unreachable | Fail closed (treated as not allowed) |
+
+## Optional short-lived cache
+
+Repeated pre-flight checks can opt into a cache with `cache: { ttlMs }` or
+`cache: { ttlLedgers }`. Caching is off by default. The key includes the call's
+contract, function, canonical XDR arguments, interceptor identity, and an
+optional policy revision. Entries are discarded on ledger advance, TTL expiry,
+or explicit `invalidate()`; transient `undetermined` results are never cached.
+
+The TTL is capped at one approximate ledger-close interval. A cached verdict
+can be staler than one admitted transfer, so integrations that need immediate
+freshness after a transfer or policy change should leave the cache disabled,
+provide a revision getter, and invalidate explicitly.
