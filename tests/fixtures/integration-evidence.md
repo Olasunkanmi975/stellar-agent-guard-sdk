@@ -159,3 +159,10 @@ transfers returned 6 of 6 allowed with no waits.
 This is worth stating plainly rather than burying: it is a client-side resource
 pricing issue, not a guard defect, and it did not let any transaction through that
 policy forbade.
+
+## Pre-flight Input Validation Verification
+
+Pre-flight interceptor input validation checks execute prior to RPC simulation dispatch:
+- Programmatic validation (`validateContractCall`) synchronously rejects invalid StrKey addresses, invalid symbols, non-array arguments, and non-i128 amounts with typed `InvalidInputError`.
+- Valid calls continue through the enforcement pipeline and retain parity with on-chain policy enforcement outcomes.
+
