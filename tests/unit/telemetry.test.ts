@@ -11,6 +11,7 @@ import { describe, it } from "node:test";
 import { xdr } from "@stellar/stellar-sdk";
 import {
   describeGuardEvent,
+  diagnosticsToEvents,
   guardEventsFromDiagnostics,
   isAllowedDecision,
   telemetryFromDecision,
@@ -125,6 +126,45 @@ describe("telemetryFromDecision", () => {
 
   it("returns nothing for an admissible decision, which has no diagnostics", () => {
     assert.deepEqual(telemetryFromDecision({ kind: "admissible" }, GUARD), []);
+  });
+});
+
+describe("diagnosticsToEvents & decode equivalence", () => {
+  it("decodes diagnostic events directly via canonical diagnosticsToEvents", () => {
+    const rawEvents = [
+      diagnosticEvent(["fn_call", "transfer"]),
+      diagnosticEvent(["event_auth_checked", "blocked", "window_cap_exceeded"]),
+    ];
+    const events = diagnosticsToEvents(rawEvents, GUARD);
+    assert.equal(events.length, 1);
+    assert.equal(events[0]!.kind, "auth_checked");
+    assert.equal(events[0]!.decision?.result, "blocked");
+    assert.equal(events[0]!.decision?.reason, "window_cap_exceeded");
+    assert.equal(events[0]!.source, "diagnostic");
+    assert.equal(events[0]!.contractId, GUARD);
+  });
+
+  it("yields identical output from guardEventsFromDiagnostics and telemetryFromDecision for equivalent inputs", () => {
+    const diagEvents = [
+      diagnosticEvent(["event_auth_checked", "blocked", "per_tx_cap_exceeded"]),
+      diagnosticEvent(["core_metrics", "cpu_insn"]),
+    ];
+
+    const fromDiagnostics = guardEventsFromDiagnostics(diagEvents, GUARD);
+    const fromDecision = telemetryFromDecision(
+      {
+        kind: "blocked",
+        reason: "per_tx_cap_exceeded",
+        diagnosticEvents: diagEvents,
+      },
+      GUARD,
+    );
+    const fromCanonical = diagnosticsToEvents(diagEvents, GUARD);
+
+    assert.deepEqual(fromDiagnostics, fromDecision);
+    assert.deepEqual(fromDiagnostics, fromCanonical);
+    assert.equal(fromDiagnostics.length, 1);
+    assert.equal(fromDiagnostics[0]!.decision?.reason, "per_tx_cap_exceeded");
   });
 });
 

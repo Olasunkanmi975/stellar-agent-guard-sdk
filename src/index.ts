@@ -82,6 +82,7 @@ export {
 export {
   GuardTelemetryListener,
   describeGuardEvent,
+  diagnosticsToEvents,
   guardEventsFromDiagnostics,
   isAllowedDecision,
   telemetryFromDecision,
