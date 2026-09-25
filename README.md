@@ -53,6 +53,19 @@ Enforcement happens **inside the account itself**, via Soroban's native Custom A
 npm install stellar-agent-guard-sdk
 ```
 
+> **Module Format & Environment Note:**
+> `stellar-agent-guard-sdk` is published strictly as **pure ESM** (`"type": "module"`) targeting **Node.js >= 24.0.0** (declared in `engines`).
+>
+> If your project or toolchain runs in CommonJS (e.g. legacy LangChain setups, Jest configs, or `.cjs` scripts), load the SDK using the dynamic `await import()` pattern:
+>
+> ```javascript
+> // CommonJS (.cjs or package without "type": "module")
+> async function run() {
+>   const { PreFlightInterceptor, CostPreChecker } = await import("stellar-agent-guard-sdk");
+>   // use interceptor, cost pre-checker, etc.
+> }
+> ```
+
 *(Or build locally from source with Node 24+)*
 
 ```bash
