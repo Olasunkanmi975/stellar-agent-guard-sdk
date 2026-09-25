@@ -53,6 +53,12 @@ jobs:
       - name: unit tests
         run: npm test
 
+      - name: build
+        run: npm run build
+
+      - name: smoke test export resolution
+        run: npm run test:smoke
+
       # A PR that changes the enforcement path must ship fresh live-testnet
       # evidence in the same PR. This checks the file list only: no network, no
       # secret, so it cannot go green on a missing credential.
