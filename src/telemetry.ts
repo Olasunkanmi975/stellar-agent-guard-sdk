@@ -89,13 +89,12 @@ function interpret(
 }
 
 /**
- * Normalise the contract events attached to a failed enforced simulation.
+ * Canonical converter from raw simulation diagnostic events to GuardEvents.
  *
- * This is the only place a *blocked* decision is observable, and it is reached
- * by passing a `PreFlightDecision`'s or an `invoke()` block's diagnostic events
- * through: no ledger query can return them.
+ * Both `guardEventsFromDiagnostics` and `telemetryFromDecision` delegate to this
+ * canonical decode engine to ensure unified field extraction and prevent divergence.
  */
-export function guardEventsFromDiagnostics(
+export function diagnosticsToEvents(
   diagnosticEvents: readonly unknown[],
   guard?: string,
 ): GuardEvent[] {
@@ -114,6 +113,23 @@ export function guardEventsFromDiagnostics(
     if (decoded) out.push(decoded);
   }
   return out;
+}
+
+/**
+ * Normalise the contract events attached to a failed enforced simulation.
+ *
+ * This accepts raw diagnostic events (e.g. from an RPC simulation failure) and
+ * converts them to GuardEvents via canonical `diagnosticsToEvents`.
+ *
+ * This is the only place a *blocked* decision is observable, and it is reached
+ * by passing a `PreFlightDecision`'s or an `invoke()` block's diagnostic events
+ * through: no ledger query can return them.
+ */
+export function guardEventsFromDiagnostics(
+  diagnosticEvents: readonly unknown[],
+  guard?: string,
+): GuardEvent[] {
+  return diagnosticsToEvents(diagnosticEvents, guard);
 }
 
 function dataOf(raw: unknown): unknown {
@@ -229,13 +245,20 @@ export class GuardTelemetryListener {
   }
 }
 
-/** Convenience: interpret one `PreFlightDecision`'s diagnostics into events. */
+/**
+ * Convenience: interpret one `PreFlightDecision`'s diagnostics into events.
+ *
+ * Accepts a preflight or simulation decision object, and extracts GuardEvents
+ * from its `diagnosticEvents` array if the decision outcome was `blocked`.
+ * Distinct from `guardEventsFromDiagnostics` which operates on raw diagnostic
+ * event arrays directly; both delegate to canonical `diagnosticsToEvents`.
+ */
 export function telemetryFromDecision(
   decision: { kind: string; diagnosticEvents?: unknown[]; reason?: string },
   guard: string,
 ): GuardEvent[] {
   if (decision.kind !== "blocked" || !decision.diagnosticEvents) return [];
-  return guardEventsFromDiagnostics(decision.diagnosticEvents, guard);
+  return diagnosticsToEvents(decision.diagnosticEvents, guard);
 }
 
 /** True when a decoded decision means the guard permitted the action. */
