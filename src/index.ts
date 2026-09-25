@@ -61,9 +61,11 @@ export {
 } from "./invoke.ts";
 
 export {
+  InvalidInputError,
   PreFlightInterceptor,
   PreFlightUndeterminedError,
   preflight,
+  validateContractCall,
   type PreFlightConfig,
   type PreFlightDecision,
 } from "./preflight.ts";

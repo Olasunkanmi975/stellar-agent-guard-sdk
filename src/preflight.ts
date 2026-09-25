@@ -24,10 +24,128 @@
  * A refused call never has a transaction hash. That is not a gap in the
  * evidence: the block happens before broadcast, which is what makes it free.
  */
-import { Keypair, rpc } from "@stellar/stellar-sdk";
+import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
 import { enforceCall } from "./invoke.ts";
 import { GuardBlockedError, explainReason } from "./reasons.ts";
 import type { ContractCall } from "./tx.ts";
+
+/**
+ * Thrown synchronously when a ContractCall has invalid shape or types
+ * before any RPC round-trip is attempted.
+ *
+ * Distinguishes programmer errors (malformed contract ID, invalid symbol shape,
+ * invalid argument types) from policy outcomes (blocked decisions).
+ */
+export class InvalidInputError extends Error {
+  readonly field: string;
+  readonly rule: string;
+  readonly detail?: string;
+
+  constructor(field: string, rule: string, detail?: string) {
+    const message = detail
+      ? `Invalid input for '${field}': violates rule '${rule}' (${detail})`
+      : `Invalid input for '${field}': violates rule '${rule}'`;
+    super(message);
+    this.name = "InvalidInputError";
+    this.field = field;
+    this.rule = rule;
+    this.detail = detail;
+  }
+}
+
+/**
+ * Validate a ContractCall's input shape before RPC dispatch.
+ * Throws InvalidInputError synchronously if any validation rule fails.
+ */
+export function validateContractCall(call: ContractCall): void {
+  if (!call || typeof call !== "object") {
+    throw new InvalidInputError("call", "required", "call must be an object");
+  }
+
+  // 1. Contract format check
+  if (typeof call.contract !== "string" || call.contract.trim() === "") {
+    throw new InvalidInputError("contract", "required", "contract ID is required and must be non-empty");
+  }
+  if (!StrKey.isValidContract(call.contract)) {
+    throw new InvalidInputError(
+      "contract",
+      "invalid_format",
+      "contract ID must be a valid C... StrKey contract address",
+    );
+  }
+
+  // 2. Method presence and shape check
+  if (typeof call.fn !== "string" || call.fn.trim() === "") {
+    throw new InvalidInputError("fn", "required", "method name is required and must be non-empty");
+  }
+  if (call.fn.length > 32 || !/^[a-zA-Z0-9_]+$/.test(call.fn)) {
+    throw new InvalidInputError(
+      "fn",
+      "symbol_shape",
+      "method name must be a symbol-shaped string of 1-32 alphanumeric or underscore characters",
+    );
+  }
+
+  // 3. Args array check
+  if (!Array.isArray(call.args)) {
+    throw new InvalidInputError("args", "array", "args must be an array of xdr.ScVal");
+  }
+  for (let i = 0; i < call.args.length; i++) {
+    const arg = call.args[i] as unknown;
+    if (!(arg instanceof xdr.ScVal)) {
+      if (
+        (call.fn === "transfer" && i === 2) ||
+        (call.fn === "transfer_from" && i === 3)
+      ) {
+        throw new InvalidInputError(
+          "amount",
+          "i128_type",
+          `amount at argument index ${i} must be an i128 ScVal (got ${typeof arg})`,
+        );
+      }
+      throw new InvalidInputError(
+        "args",
+        "typed_scval",
+        `argument at index ${i} must be an xdr.ScVal instance`,
+      );
+    }
+  }
+
+  // 4. Amount type check for known token operations
+  if (call.fn === "transfer") {
+    if (call.args.length < 3) {
+      throw new InvalidInputError(
+        "args",
+        "missing_argument",
+        "transfer expects at least 3 arguments: [from, to, amount]",
+      );
+    }
+    const amountVal = call.args[2];
+    if (amountVal.type !== "scvI128") {
+      throw new InvalidInputError(
+        "amount",
+        "i128_type",
+        `transfer amount must be an i128 ScVal (received type: ${amountVal.type})`,
+      );
+    }
+  } else if (call.fn === "transfer_from") {
+    if (call.args.length < 4) {
+      throw new InvalidInputError(
+        "args",
+        "missing_argument",
+        "transfer_from expects at least 4 arguments: [spender, from, to, amount]",
+      );
+    }
+    const amountVal = call.args[3];
+    if (amountVal.type !== "scvI128") {
+      throw new InvalidInputError(
+        "amount",
+        "i128_type",
+        `transfer_from amount must be an i128 ScVal (received type: ${amountVal.type})`,
+      );
+    }
+  }
+}
 
 /**
  * Thrown when enforcement could not reach a decision.
@@ -96,6 +214,7 @@ export class PreFlightInterceptor {
    * throws for a refusal — a block is a normal, expected result.
    */
   async check(call: ContractCall): Promise<PreFlightDecision> {
+    validateContractCall(call);
     const outcome = await enforceCall({
       server: this.config.server,
       source: this.config.source,
