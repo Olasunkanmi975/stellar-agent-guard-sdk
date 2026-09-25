@@ -66,8 +66,11 @@ export {
   PreFlightUndeterminedError,
   preflight,
   validateContractCall,
+  type PolicyRevision,
+  type PreFlightCacheOptions,
   type PreFlightConfig,
   type PreFlightDecision,
+  type PreFlightInterceptorOptions,
 } from "./preflight.ts";
 
 export {
@@ -84,6 +87,7 @@ export {
 export {
   GuardTelemetryListener,
   describeGuardEvent,
+  diagnosticsToEvents,
   guardEventsFromDiagnostics,
   isAllowedDecision,
   telemetryFromDecision,

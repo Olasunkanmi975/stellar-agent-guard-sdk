@@ -37,7 +37,7 @@ Enforcement happens **inside the account itself**, via Soroban's native Custom A
 
 ## What it does
 
-- **Pre-flight policy interception (`PreFlightInterceptor`)**: Intercepts contract calls before broadcast, simulates auth authorization, and returns a discriminated `admissible`, `blocked`, or `undetermined` verdict. Never throws on policy refusal.
+- **Pre-flight policy interception (`PreFlightInterceptor`)**: Intercepts contract calls before broadcast, simulates auth authorization, and returns a discriminated `admissible`, `blocked`, or `undetermined` verdict. Never throws on policy refusal; an opt-in short-lived cache can reduce repeated simulation RPC calls within the current ledger.
 - **In-process cost pre-checking (`CostPreChecker`)**: Prices transaction execution from simulation results, reporting resource fees, inclusion fees, and total fees against an optional ceiling.
 - **Autonomous transaction execution (`invoke()`)**: Executes the full Soroban lifecycle: probe simulation, auth signing for custom accounts, enforced simulation, and broadcast with bounded retry for stale ledger resource limits (`scecExceededLimit`).
 - **Framework adapters**:
@@ -52,6 +52,19 @@ Enforcement happens **inside the account itself**, via Soroban's native Custom A
 ```bash
 npm install stellar-agent-guard-sdk
 ```
+
+> **Module Format & Environment Note:**
+> `stellar-agent-guard-sdk` is published strictly as **pure ESM** (`"type": "module"`) targeting **Node.js >= 24.0.0** (declared in `engines`).
+>
+> If your project or toolchain runs in CommonJS (e.g. legacy LangChain setups, Jest configs, or `.cjs` scripts), load the SDK using the dynamic `await import()` pattern:
+>
+> ```javascript
+> // CommonJS (.cjs or package without "type": "module")
+> async function run() {
+>   const { PreFlightInterceptor, CostPreChecker } = await import("stellar-agent-guard-sdk");
+>   // use interceptor, cost pre-checker, etc.
+> }
+> ```
 
 *(Or build locally from source with Node 24+)*
 
@@ -99,6 +112,45 @@ Pre-flight policy interception makes an intentional asymmetric distinction betwe
 - **Policy refusals return a verdict (`kind: "blocked"`)**: When input is valid but policy disallows the action (spend cap exceeded, recipient not allowlisted, account paused), this represents expected guardrail operation. `check()` returns `{ allowed: false, kind: "blocked", reason, explanation, ... }` instead of throwing.
 - Callers requiring a throw-on-refusal flow can use `interceptor.assertAllowed(call)`, which throws `GuardBlockedError` on `blocked` and `PreFlightUndeterminedError` on `undetermined`.
 
+### Optional simulation-result cache
+
+`PreFlightInterceptor` always performs a fresh simulation by default. For agent
+loops that repeatedly check the same call, caching can be enabled explicitly:
+
+```ts
+const interceptor = new PreFlightInterceptor({
+  server,
+  networkPassphrase,
+  guard,
+  agent,
+  source,
+  cache: {
+    ttlLedgers: 1, // maximum one approximate five-second ledger window
+    policyRevision: () => readPolicyRevision(),
+  },
+});
+
+const first = await interceptor.check(call);
+const second = await interceptor.check(call); // may reuse the first verdict
+interceptor.invalidate();                       // clear all entries
+interceptor.invalidate(call);                  // clear one call's entries
+```
+
+The cache is **disabled unless `cache` is supplied**. It stores only actual
+`admissible` and `blocked` decisions; transient `undetermined` results are not
+cached. A cache key includes the contract, function, canonical XDR argument
+fingerprint, interceptor identity, and the supplied policy revision. The cache
+is discarded when the observed ledger advances, when the TTL expires, or when
+`invalidate()` is called. `ttlMs` and `ttlLedgers` are both capped at one
+approximate ledger-close interval; if both are supplied, `ttlMs` takes
+precedence.
+
+A **cached verdict can be staler than one admitted transfer**. The rolling spend
+window can change after a simulation while a cached result is still being
+reused, so callers that cannot tolerate that tradeoff should leave caching off,
+use a shorter TTL, provide a policy revision, and invalidate after policy or
+account-state changes.
+
 ### Framework Middleware (LangChain & ElizaOS)
 
 ```ts
@@ -133,9 +185,10 @@ const validate = createGuardValidator({
 ### Interception & Execution
 
 - `PreFlightInterceptor`
-  - `constructor(options: PreFlightInterceptorOptions)`
+  - `constructor(options: PreFlightInterceptorOptions)` — Pass `cache: { ttlMs }` or `cache: { ttlLedgers }` to opt into the short-lived cache; omit it for fresh simulations.
   - `check(call: ContractCall): Promise<PreFlightDecision>` — Returns `admissible | blocked | undetermined` without throwing or broadcasting.
   - `assertAllowed(call: ContractCall): Promise<AdmissibleDecision>` — Asserts allowed or throws `GuardBlockedError`.
+  - `invalidate(call?: ContractCall): void` — Clears all cached decisions or only entries for one call.
 - `CostPreChecker`
   - `constructor(options: CostPreCheckerOptions)`
   - `check(call: ContractCall): Promise<CostPreCheckResult>` — Returns `within_budget | over_budget | blocked | undetermined`.
