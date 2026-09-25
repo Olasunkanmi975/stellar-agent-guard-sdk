@@ -26,6 +26,7 @@ import { topicSymbols } from "../../src/invoke.ts";
 import { GUARD_REASON_CODES } from "../../src/reasons.ts";
 import {
   TESTNET_PASSPHRASE,
+  assertPreconditions,
   guardTokenBalance,
   installPolicy,
   loadPhase2Config,
@@ -86,16 +87,13 @@ before(async () => {
   config = await loadPhase2Config();
   server = new rpc.Server(config.rpcUrl);
 
-  // Refuse to test against an instance whose live config differs from the
-  // fixture the tests reason about — otherwise every amount below is a guess.
-  const policy = await readPolicy(server, config);
-  assert.ok(policy, "the Phase 2 instance has no policy installed");
-  const status = await readStatus(server, config);
-  assert.equal(status.admin_frozen, false, "the Phase 2 instance is admin-frozen");
-  assert.equal(status.heartbeat_expired, false, "the Phase 2 instance is dead-man frozen");
+  // Assert preconditions upfront (code exists, policy active, agent funded, token funded)
+  const preconditions = await assertPreconditions(server, config);
+  const policy = (await readPolicy(server, config))!;
 
   console.log(
-    `[live] guard ${config.guard}\n` +
+    `[live preconditions OK] agent balance: ${preconditions.agentBalanceXlm} XLM, token balance: ${preconditions.tokenBalance}\n` +
+      `[live] guard ${config.guard}\n` +
       `[live] per-tx cap ${policy.per_tx_cap}, rolling window ${policy.window_cap}/${policy.window_secs}s, ` +
       `${policy.recipients.length} allowlisted recipient(s)`,
   );
