@@ -33,6 +33,7 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "node --import tsx --test tests/unit/*.test.ts",
+    "test:smoke": "node --input-type=module -e \"import('./dist/index.js').then(m => { if (!m.PreFlightInterceptor) throw new Error('Missing PreFlightInterceptor'); console.log('ESM export-map resolution smoke test passed: ' + Object.keys(m).length + ' exports found'); })\"",
     "test:integration": "node --test --test-concurrency=1 tests/integration/*.test.ts",
     "inspect": "node scripts/inspect-deployment.ts",
     "deploy:phase2": "node scripts/deploy-phase2-instance.ts",
