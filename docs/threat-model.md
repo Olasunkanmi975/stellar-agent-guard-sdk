@@ -8,6 +8,11 @@ Audit lens: every row below names the asset, the threat, how the SDK mitigates
 it (citing the implementing code and a test), the residual risk, and the
 on-chain backstop that the SDK cannot bypass.
 
+Where each of those inputs actually enters or leaves the SDK — signer callbacks,
+auth digests, RPC data, telemetry, logs, and adapters — is mapped separately in
+the [attack-surface inventory](./attack-surface.md). That document is an
+inventory of boundaries, not a second threat model: the threats stay here.
+
 ---
 
 ## Trust chain

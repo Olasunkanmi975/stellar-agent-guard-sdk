@@ -81,6 +81,11 @@ npm install stellar-agent-guard-sdk
 >   // use interceptor, cost pre-checker, etc.
 > }
 > ```
+>
+
+The full tested matrix — Node version, ESM/CJS behaviour, browser and bundler
+targets, plus the environments that are explicitly unsupported — is in
+[`docs/runtime-support.md`](docs/runtime-support.md).
 
 *(Or build locally from source with Node 24+)*
 
@@ -1013,6 +1018,8 @@ const recentWindow = listener.recent({ fromLedger: 4_700_000 });
 
 What it returns is a **detached snapshot**: the array, the events in it, their decoded `data`/`decision` and the opt-in `raw` payload are all copies, so editing a returned event cannot change what the listener still retains. A listener with no `buffer` configured copies nothing — `recent()` returns `[]`.
 
+`recentJsonLines(filter?)` returns the same bounded window as **JSON Lines** (issue #324) — one `serializeEventRecord()` line per event, oldest first, `filter` applied identically. It returns a string and never touches the filesystem; `bigint` values are decimal strings and byte arrays are `bytes:<hex>`, so the export parses without the SDK. The opt-in `raw` payload is never included: the projection is a fixed field list, so an incident bundle cannot leak a retained debug payload.
+
 #### Raw events for bug reports (issue #94)
 
 When a decoded verdict looks wrong, attach the **undecoded source event** to the SDK bug report. Decoding discards it by default — the raw payload carries XDR `ScVal`s and host-shaped objects, and retaining one per event is a memory decision — so it is opt-in:
@@ -1172,6 +1179,7 @@ This boundary is an inherent property of the platform (the auth context does not
 - GitHub issues: <https://github.com/aigbagbobila/stellar-agent-guard-sdk/issues>
 - Maintainer (GitHub): [@aigbagbobila](https://github.com/aigbagbobila)
 - Security disclosures: see the local [SECURITY.md](SECURITY.md) for SDK issues; contract/protocol issues and deployed-instance incidents go to the contracts repo's [SECURITY.md](https://github.com/aigbagbobila/stellar-agent-guard-contracts/blob/main/SECURITY.md)
+- Security review: [`docs/attack-surface.md`](docs/attack-surface.md) maps where untrusted data enters and leaves the SDK, and [`docs/threat-model.md`](docs/threat-model.md) states what can go wrong
 
 ## License
 

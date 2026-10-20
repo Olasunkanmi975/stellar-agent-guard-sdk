@@ -1651,6 +1651,115 @@ describe("GuardDecisionCounters wall-clock resilience (issue #320)", () => {
 });
 
 /**
+ * Counter coverage and reset semantics (#321).
+ *
+ * A zero `blocked` count is only evidence that nothing was refused when both
+ * decision-bearing streams have fed the counters. These tests pin the three
+ * cases the issue calls out — committed-only, unified, and no observation — and
+ * prove that reset clears coverage instead of leaving a stale `complete`.
+ */
+describe("GuardTelemetryListener counter coverage (issue #321)", () => {
+  const decisionEvent = (
+    result: "allowed" | "blocked",
+    reason: string | null,
+    index: number,
+    stream: "committed" | "diagnostic" | "failed_tx",
+  ): GuardEvent => ({
+    id: `${stream}:${index.toString(16).padStart(64, "0")}`,
+    kind: "auth_checked",
+    topic: "event_auth_checked",
+    source: stream === "committed" ? "ledger" : "diagnostic",
+    stream,
+    contractId: GUARD,
+    ledger: stream === "committed" ? index : null,
+    ledgerClosedAt: stream === "committed" ? new Date(index).toISOString() : null,
+    observedAt: stream === "committed" ? null : new Date(index).toISOString(),
+    transactionHash: stream === "committed" ? "ab".repeat(32) : null,
+    decision: { result, reason, source: stream === "committed" ? "ledger" : "diagnostic" } as GuardEvent["decision"],
+    data: {},
+  });
+
+  it("reports no observation rather than a confident zero", () => {
+    const listener = new GuardTelemetryListener({ counters: { windowEvents: 10 } });
+    const stats = listener.stats();
+    assert.ok(stats);
+    assert.equal(stats!.blocked, 0);
+    assert.equal(stats!.coverage.status, "none");
+    assert.equal(stats!.coverage.observed, 0);
+    assert.deepEqual(stats!.coverage.seen, []);
+    assert.deepEqual(stats!.coverage.missing, ["committed", "diagnostic"]);
+  });
+
+  it("reports incomplete coverage when only committed events were observed", () => {
+    const listener = new GuardTelemetryListener({ counters: { windowEvents: 10 } });
+    listener.observe(decisionEvent("allowed", null, 1, "committed"));
+    const stats = listener.stats();
+    assert.ok(stats);
+    assert.equal(stats!.coverage.status, "incomplete");
+    assert.equal(stats!.coverage.observed, 1);
+    assert.deepEqual(stats!.coverage.seen, ["committed"]);
+    assert.deepEqual(stats!.coverage.missing, ["diagnostic"]);
+    assert.deepEqual(stats!.coverage.streams, { committed: 1, diagnostic: 0, failed_tx: 0 });
+  });
+
+  it("reports complete coverage only once both decision streams have fed", () => {
+    const listener = new GuardTelemetryListener({ counters: { windowEvents: 10 } });
+    listener.observe(decisionEvent("allowed", null, 1, "committed"));
+    listener.observe(decisionEvent("blocked", "per_tx_cap_exceeded", 2, "diagnostic"));
+    const stats = listener.stats();
+    assert.ok(stats);
+    assert.equal(stats!.coverage.status, "complete");
+    assert.deepEqual(stats!.coverage.missing, []);
+    assert.deepEqual(stats!.coverage.seen, ["committed", "diagnostic"]);
+    // Counted once each: coverage counts and window counts agree.
+    assert.equal(stats!.coverage.observed, 2);
+    assert.equal(stats!.allowed + stats!.blocked, 2);
+    assert.equal(stats!.blocked, 1);
+  });
+
+  it("does not treat a failed-transaction stream as the diagnostic half", () => {
+    const listener = new GuardTelemetryListener({ counters: { windowEvents: 10 } });
+    listener.observe(decisionEvent("allowed", null, 1, "committed"));
+    listener.observe(decisionEvent("blocked", "per_tx_cap_exceeded", 2, "failed_tx"));
+    const stats = listener.stats();
+    assert.ok(stats);
+    assert.equal(stats!.coverage.status, "incomplete");
+    assert.deepEqual(stats!.coverage.missing, ["diagnostic"]);
+  });
+
+  it("clears counts and coverage together on resetStats(), without double-counting", () => {
+    const listener = new GuardTelemetryListener({ counters: { windowEvents: 10 } });
+    listener.observe(decisionEvent("blocked", "per_tx_cap_exceeded", 1, "committed"));
+    listener.resetStats();
+    const afterReset = listener.stats();
+    assert.ok(afterReset);
+    assert.equal(afterReset!.blocked, 0);
+    assert.deepEqual(afterReset!.byReason, {});
+    assert.equal(afterReset!.coverage.status, "none");
+    assert.equal(afterReset!.coverage.observed, 0, "coverage is reset, not stale-complete");
+
+    // A reset listener counts only what arrives after it, once.
+    listener.observe(decisionEvent("allowed", null, 2, "committed"));
+    const afterOne = listener.stats();
+    assert.ok(afterOne);
+    assert.equal(afterOne!.allowed, 1);
+    assert.equal(afterOne!.coverage.observed, 1);
+  });
+
+  it("resets a cumulative coverage record while the window evicts independently", () => {
+    const listener = new GuardTelemetryListener({ counters: { windowEvents: 1 } });
+    listener.observe(decisionEvent("allowed", null, 1, "committed"));
+    listener.observe(decisionEvent("blocked", "per_tx_cap_exceeded", 2, "diagnostic"));
+    const stats = listener.stats();
+    assert.ok(stats);
+    // The window holds one decision; coverage still records both streams.
+    assert.equal(stats!.allowed + stats!.blocked, 1);
+    assert.equal(stats!.coverage.observed, 2);
+    assert.equal(stats!.coverage.status, "complete");
+  });
+});
+
+/**
  * Emitting-identity validation before decoding (#322).
  *
  * `poll()` filters by contract server-side, but does not trust that filter. An

@@ -38,6 +38,30 @@ class instance, so an XDR value inside a `raw` payload still behaves like the
 XDR value it was. With no `buffer` configured there is nothing to copy: the
 call returns `[]` and allocates nothing.
 
+### `recentJsonLines(filter?): string`
+
+The retained window exported as bounded **JSON Lines** (issue #324): one
+`serializeEventRecord()` line per event, oldest first, with `filter` applied
+exactly as `recent()` applies it. At most `buffer.max` lines are produced, so an
+incident handoff is a snapshot of the configured window rather than an
+unbounded dump. With no `buffer` configured the result is `''`.
+
+Every line is a complete, independently parsable record —
+`parseEventRecord(line)` returns `{ version: 1, event }` — and the rendering is
+`serializeEvent()`'s: fixed key order, `undefined` dropped, `null` kept,
+`bigint` as a decimal string (`"9007199254740993"`), bytes as `bytes:<hex>`.
+The result is deterministic, so two calls over the same retained window are
+byte-identical.
+
+**No filesystem access.** The SDK returns a string; where (or whether) to write
+it is the caller's decision, so core keeps its no-`node:fs` discipline.
+
+**Raw-payload redaction.** The projection has a fixed field list and `raw` is
+not on it, so a payload retained by `includeRaw` for debugging is never
+serialized — exporting a window cannot leak the host-shaped payload by
+accident. The full output is a detached snapshot, so mutating what `recent()`
+returns cannot change a later export.
+
 ### `pollFailedTransactions(params?): Promise<FailedTxPollResult>`
 
 Reads one page from the independent `getTransactions` cursor. Pass the returned
@@ -135,14 +159,56 @@ interface CounterSnapshot {
   byReason: Record<string, number>;
   windowStart: number;
   windowEvents?: number;
+  coverage: {
+    observed: number;                                        // cumulative, not windowed
+    streams: { committed: number; diagnostic: number; failed_tx: number };
+    seen: ('committed' | 'diagnostic' | 'failed_tx')[];
+    missing: ('committed' | 'diagnostic')[];
+    status: 'none' | 'incomplete' | 'complete';
+  };
 }
 ```
 
 Counts are maintained over the configured window (`windowEvents` events or
-`windowMs` milliseconds) and updated on every event from the unified stream.
+`windowMs` milliseconds) and updated on every decision the listener delivers:
+committed and failed-transaction events from `poll()`/`watch()`, diagnostic
+events merged by `watchAll()`, and anything a host feeds through `observe()`.
+Each decision is counted once — `watchAll()` records only its diagnostic half,
+because the committed half was already counted by the page loop underneath it.
 The returned object is a deep snapshot: mutating it never affects the listener's
 state. When `counters` is not set, `stats()` returns `null` and no counter
 structures are allocated.
+
+#### Coverage: why `blocked: 0` is not "nothing was refused" (issue #321)
+
+A blocked decision never commits — the guard returns `Err`, so Soroban rolls the
+event back before broadcast. A listener that only watched committed events
+therefore cannot have seen a refusal, and its `blocked` count says nothing about
+whether one occurred. `coverage` makes that distinction explicit:
+
+| `coverage.status` | Meaning |
+| --- | --- |
+| `none` | No decision has reached the counters. Every count is zero for lack of input. |
+| `incomplete` | Some decisions were counted, but at least one decision-bearing stream was never fed. `missing` names it. |
+| `complete` | Both the committed and the diagnostic stream have delivered at least one decision, so the counters cover the tracked decision surface. |
+
+`coverage` is **cumulative since construction or the last `resetStats()`**, while
+`allowed`/`blocked`/`byReason` are windowed — coverage is a fact about what was
+wired up, which eviction must not erase. `failed_tx` counts appear in `streams`
+and `seen`, but do not satisfy the diagnostic half: those events are rolled-back
+decisions from this listener's own retry path, not the simulation diagnostics the
+unified stream carries. A zero `blocked` count is only evidence that nothing was
+refused when `status` is `complete`; when it is `none` or `incomplete`, read the
+`missing` list and wire the stream before drawing a conclusion.
+
+#### Reset semantics
+
+`resetStats()` clears the window, `byReason`, the counts **and** the coverage
+record, and drops the monotonic clock high-water mark so the next observation
+establishes a fresh epoch. Reset is deliberately total: clearing counts while
+keeping `complete` would recreate the misreading coverage exists to prevent.
+The listener's streams, cursors, `recent()` buffer and `health()` state are
+untouched — this resets the counter view, not the stream.
 
 `windowStart` is on the counter's **monotonic** timeline, not a raw wall-clock
 reading. Observations are clamped to a non-decreasing internal time, so a

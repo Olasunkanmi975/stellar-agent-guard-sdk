@@ -1112,6 +1112,55 @@ export interface GuardTelemetryCountersOptions {
   clock?: () => number;
 }
 
+/**
+ * How complete the counters' view of the guard's decisions is (#321).
+ *
+ * - `none` — no decision has reached the counters, so every count is zero for
+ *   lack of input rather than because the guard decided nothing.
+ * - `incomplete` — decisions were counted, but at least one decision-bearing
+ *   stream has never been fed. A zero `blocked` count on this status means
+ *   "no refusal was observed on the stream(s) in `seen`", not "nothing was
+ *   refused".
+ * - `complete` — both the committed stream and the diagnostic stream have fed
+ *   at least one decision, so the counters cover the whole decision surface a
+ *   `watchAll()` consumer sees.
+ */
+export type GuardTelemetryCoverageStatus = "none" | "incomplete" | "complete";
+
+/**
+ * What the counters have actually observed, as opposed to what they counted.
+ *
+ * `stats()` alone cannot answer "was nothing blocked?" — a listener that only
+ * tailed committed ledger events never sees a blocked decision at all, because
+ * the guard's `Err` rolls that event back before broadcast. This metadata makes
+ * the difference explicit instead of leaving a zero to be misread.
+ *
+ * Counts here are **cumulative since construction or the last
+ * `resetStats()`**, not windowed: coverage is a fact about what was wired up,
+ * which eviction must not erase.
+ */
+export interface GuardTelemetryCoverage {
+  /** Decisions fed to the counters since construction or the last reset. */
+  observed: number;
+  /** Per-stream decision counts since construction or the last reset. */
+  streams: Record<GuardEventStream, number>;
+  /**
+   * Streams that have fed at least one decision, in stable order
+   * (`committed`, `diagnostic`, `failed_tx`).
+   */
+  seen: GuardEventStream[];
+  /**
+   * Streams still required for `complete`, in stable order. Empty when the
+   * status is `complete`; both decision-bearing streams when it is `none`.
+   *
+   * `failed_tx` is *not* required: it carries the same blocked decisions the
+   * diagnostic stream does, so observing it alone cannot make the counters
+   * claim complete coverage of the committed side.
+   */
+  missing: GuardEventStream[];
+  status: GuardTelemetryCoverageStatus;
+}
+
 /** A snapshot of the sliding-window counters. Never mutated by callers. */
 export interface GuardTelemetryStats {
   /** Decisions observed in the window whose verdict was `allowed`. */
@@ -1129,6 +1178,12 @@ export interface GuardTelemetryStats {
    * `Date.now()`; treat it as the start of the retained interval.
    */
   windowStart: number;
+  /**
+   * Which streams fed these counters (#321). Additive; a consumer that only
+   * reads the counts above is unaffected. Read `coverage.status` before
+   * treating a zero `blocked` count as evidence that nothing was refused.
+   */
+  coverage: GuardTelemetryCoverage;
 }
 
 /** One decision recorded in the window, retained for eviction. */
@@ -1152,6 +1207,20 @@ export class GuardDecisionCounters {
   private allowed = 0;
   private blocked = 0;
   private readonly byReason = new Map<string, number>();
+  /** Decisions fed to the counters since construction or the last reset. */
+  private observations = 0;
+
+  /**
+   * Per-stream decision counts since construction or the last reset (#321).
+   * Not windowed: coverage records which streams were ever wired up, a fact
+   * eviction must not erase.
+   */
+  private readonly streamCounts: Record<GuardEventStream, number> = {
+    committed: 0,
+    diagnostic: 0,
+    failed_tx: 0,
+  };
+
   /**
    * High-water mark of the injected clock (#320).
    *
@@ -1189,6 +1258,8 @@ export class GuardDecisionCounters {
     const verdict = isAllowedDecision(event.decision) ? "allowed" : "blocked";
     const reason = event.decision.reason ?? null;
     const at = this.monotonicNow();
+    this.observations += 1;
+    this.streamCounts[event.stream] += 1;
     this.entries.push({ verdict, reason, at });
     if (verdict === "allowed") this.allowed += 1;
     else {
@@ -1241,6 +1312,52 @@ export class GuardDecisionCounters {
     }
   }
 
+  /**
+   * Which decision streams have fed these counters (#321), as a fresh copy.
+   *
+   * Status is `none` until a decision arrives, `complete` only when both the
+   * committed and the diagnostic streams have delivered one, and `incomplete`
+   * in between. A listener fed only by `watch()` — or only by simulation
+   * diagnostics — therefore reports `incomplete` and names the missing stream,
+   * instead of presenting a one-sided count as the whole picture.
+   */
+  coverage(): GuardTelemetryCoverage {
+    const order: readonly GuardEventStream[] = ["committed", "diagnostic", "failed_tx"];
+    const seen = order.filter((stream) => this.streamCounts[stream] > 0);
+    const required: readonly GuardEventStream[] = ["committed", "diagnostic"];
+    const missing = required.filter((stream) => this.streamCounts[stream] === 0);
+    const status: GuardTelemetryCoverageStatus =
+      this.observations === 0 ? "none" : missing.length === 0 ? "complete" : "incomplete";
+    return {
+      observed: this.observations,
+      streams: { ...this.streamCounts },
+      seen,
+      missing: [...missing],
+      status,
+    };
+  }
+
+  /**
+   * Clear the window, the counts, and the coverage record (#321).
+   *
+   * Reset is total on purpose: leaving coverage behind would let a caller
+   * clear the counts and then read `complete` over an empty window, which is
+   * exactly the confusion the coverage metadata exists to prevent. The
+   * monotonic clock high-water mark is dropped too, so the next observation
+   * establishes a fresh epoch rather than inheriting the old one.
+   */
+  reset(): void {
+    this.entries.length = 0;
+    this.allowed = 0;
+    this.blocked = 0;
+    this.byReason.clear();
+    this.observations = 0;
+    this.streamCounts.committed = 0;
+    this.streamCounts.diagnostic = 0;
+    this.streamCounts.failed_tx = 0;
+    this.lastObservedAt = null;
+  }
+
   /** A fresh snapshot; callers may mutate it freely. */
   stats(): GuardTelemetryStats {
     this.evict();
@@ -1249,6 +1366,7 @@ export class GuardDecisionCounters {
       blocked: this.blocked,
       byReason: Object.fromEntries(this.byReason),
       windowStart: this.entries.length > 0 ? this.entries[0]!.at : this.monotonicNow(),
+      coverage: this.coverage(),
     };
   }
 }
@@ -1699,6 +1817,19 @@ export class GuardTelemetryListener {
   }
 
   /**
+   * Clear the sliding-window counters, including their coverage record
+   * (#321). A no-op when counters were not opted into.
+   *
+   * The listener's own state — cursors, buffer, health — is untouched: this
+   * resets the counter view, not the stream. Events already retained by
+   * `recent()` are not re-counted after a reset, so a subsequent `watchAll()`
+   * counts only decisions observed from that point on.
+   */
+  resetStats(): void {
+    this.counters?.reset();
+  }
+
+  /**
    * The most recent events the listener has observed, oldest first, optionally
    * narrowed by `filter` (issue #68). Empty when no `buffer` was configured.
    *
@@ -1718,6 +1849,27 @@ export class GuardTelemetryListener {
    */
   recent(filter?: RecentEventFilter): GuardEvent[] {
     return this.buffer ? this.buffer.recent(filter) : [];
+  }
+
+  /**
+   * The retained window as bounded JSON Lines (#324): one
+   * `serializeEventRecord()` line per event, oldest first, `filter` applied
+   * exactly as `recent()` applies it.
+   *
+   * The export is a string, never a file: where (or whether) to persist it is
+   * the caller's decision, so the SDK keeps its no-filesystem-access
+   * discipline. With no `buffer` configured the result is `''`.
+   *
+   * The boundedness is the buffer's: this returns at most `buffer.max` lines,
+   * so an incident handoff is a snapshot of the configured window, not an
+   * unbounded dump. Each line is JSON-safe (a `bigint` is a decimal string, a
+   * byte array is `bytes:<hex>`), and the opt-in `raw` payload is **never**
+   * serialized — the projection has a fixed field list that does not include
+   * it, so exporting cannot leak a host payload that `includeRaw` retained for
+   * debugging.
+   */
+  recentJsonLines(filter?: RecentEventFilter): string {
+    return serializeEventLines(this.recent(filter));
   }
 
   /** Record decoded events into the opt-in buffer, if one is configured. */
@@ -2211,6 +2363,12 @@ export class GuardTelemetryListener {
 
       const events = [...page.events, ...failedTxEvents];
 
+      // Counters are fed here, at the one place a page's events become the
+      // caller's, so every entry point counts each committed/failed-tx
+      // decision exactly once (#321). `watchAll()` records only the
+      // diagnostic half of its merged stream for the same reason.
+      for (const event of events) this.counters?.record(event);
+
       await this.activeCursorStore.save(page.cursor);
       
       if (events.length > 0) yield events;
@@ -2265,11 +2423,14 @@ export class GuardTelemetryListener {
         params.diagnostics,
         params.signal,
       )) {
-        this.counters?.record(event);
-        // Committed events were already recorded when their page was decoded in
-        // `poll()`, so only the diagnostic half is recorded here — recording the
-        // merged stream wholesale would double every committed event.
-        if (event.stream === "diagnostic") this.record([event]);
+        // Committed and failed-tx events were already counted by the page loop
+        // in `watchStream()`, so only the diagnostic half is counted here —
+        // counting the merged stream wholesale would double every event the
+        // committed side contributed.
+        if (event.stream === "diagnostic") {
+          this.counters?.record(event);
+          this.record([event]);
+        }
         yield event;
       }
     } finally {
@@ -2465,6 +2626,27 @@ export function serializeEventRecord(event: GuardEvent): string {
     event: projectEvent(event),
   };
   return JSON.stringify(toJsonSafe(record));
+}
+
+/**
+ * Render an event sequence as bounded JSON Lines (#324): one
+ * `serializeEventRecord()` per event, newline-terminated, in iteration order.
+ *
+ * Deliberately synchronous and allocation-only: no file handle, no stream, no
+ * buffer copy beyond the output string. A caller exporting the listener's
+ * `recent()` window gets exactly the bounded snapshot it asked for, and a
+ * caller with its own store can render any iterable with the same rules.
+ *
+ * Every line is a complete, independently parsable record
+ * (`parseEventRecord()`), so a partially written export is still a valid prefix
+ * of complete records — there is no trailing half-line to special-case.
+ * `raw` is never emitted: the projection is a fixed field list, so a retained
+ * debug payload cannot ride along into a shared incident bundle.
+ */
+export function serializeEventLines(events: Iterable<GuardEvent>): string {
+  let out = "";
+  for (const event of events) out += `${serializeEventRecord(event)}\n`;
+  return out;
 }
 
 /** The result of reading one stored telemetry line. */

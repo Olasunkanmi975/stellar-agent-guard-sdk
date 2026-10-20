@@ -2,6 +2,7 @@
 
 * [Introduction](introduction.md)
 * [Installation](installation.md)
+* [Runtime and Bundler Support](runtime-support.md)
 * [Concepts](concepts/)
   * [Pre-Flight Interception](concepts/pre-flight-interception.md)
   * [Simulation Cost Pre-Checking](concepts/simulation-cost-pre-checking.md)
@@ -22,6 +23,7 @@
 * [Enforcement Scope](enforcement-scope.md)
 * [Troubleshooting](troubleshooting.md)
 * [Threat Model](threat-model.md)
+* [Attack-Surface Inventory](attack-surface.md)
 * [Contributing](contributing.md)
 * [Releasing](releasing.md)
 * [API Deprecations](deprecations.md)

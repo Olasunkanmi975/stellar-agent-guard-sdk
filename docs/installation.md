@@ -7,6 +7,10 @@
   `npm run test:browser`.
 - `@stellar/stellar-sdk`: `^17.0.1` (runtime dependency)
 
+What is actually executed in CI — supported Node version, ESM-only behaviour,
+browser/bundler targets, and the environments that are explicitly unsupported —
+is listed in the [runtime and bundler support matrix](./runtime-support.md).
+
 ## Installing from NPM
 
 ```bash
