@@ -30,8 +30,12 @@ import type { ContractCall } from "../tx.ts";
 import {
   blockedInfoFor,
   blockedInfoForBatch,
+  checkOptionsFor,
+  hostAbortSignal,
   mapContractCalls,
+  mappingFailureFor,
   runBlockedHook,
+  runDecisionHook,
   type BlockedHookLogger,
   type GuardBlockedHook,
 } from "./shared.ts";
@@ -98,6 +102,18 @@ export interface McpGuardOptions {
    * adapter never broadcasts, so no `broadcast` events can appear here.
    */
   onStep?: (step: InvokeStepEvent) => void;
+  /**
+   * Caller-owned cancellation, forwarded to every pre-flight `check()`
+   * (issue #315). For `guardMcpToolHandler` the host's invocation signal
+   * (`extra.signal`) takes precedence when the SDK provides one.
+   */
+  signal?: AbortSignal | undefined;
+  /**
+   * Bound on each RPC call made by the pre-flight check, in milliseconds
+   * (issue #315); `0` disables it. A fired timeout yields the same fail-closed
+   * `undetermined` verdict as an abort.
+   */
+  timeoutMs?: number | undefined;
 }
 
 /**
@@ -112,15 +128,28 @@ async function guardMcpRequest<T extends McpToolResult>(
   request: McpToolCallRequest,
   proceed: () => Promise<T>,
   options: McpGuardOptions,
+  hostSignal?: AbortSignal | undefined,
 ): Promise<T | McpToolResult> {
-  const calls = mapContractCalls(request, options);
+  let calls: ContractCall[];
+  try {
+    calls = mapContractCalls(request, options);
+  } catch (error) {
+    // Fail closed on a mapper failure (issue #316): the tool body never runs and
+    // the halt is reported as undetermined, without a mapped `call`.
+    const failure = mappingFailureFor("mcp", error);
+    runBlockedHook(options.onBlocked, failure.info, options.blockedHookLogger);
+    return {
+      content: [{ type: "text", text: describeMcpRefusal(failure.decision, request.name) }],
+      isError: true,
+    };
+  }
   if (calls.length === 0) return proceed();
 
+  const checkOptions = checkOptionsFor(options, hostSignal);
+
   if (calls.length === 1) {
-    const decision = await options.interceptor.check(calls[0]!, {
-      ...(options.onStep ? { onStep: options.onStep } : {}),
-    });
-    options.onDecision?.(request, decision);
+    const decision = await options.interceptor.check(calls[0]!, checkOptions);
+    runDecisionHook(options.onDecision, [request, decision], "mcp", options.blockedHookLogger);
     if (decision.allowed) return proceed();
 
     runBlockedHook(
@@ -136,10 +165,10 @@ async function guardMcpRequest<T extends McpToolResult>(
 
   // Batch mapping: report every per-call verdict, and refuse the whole action if
   // any call is blocked or undetermined (all-or-nothing).
-  const batch = await options.interceptor.checkBatch(calls, {
-    ...(options.onStep ? { onStep: options.onStep } : {}),
-  });
-  for (const verdict of batch.verdicts) options.onDecision?.(request, verdict);
+  const batch = await options.interceptor.checkBatch(calls, checkOptions);
+  for (const verdict of batch.verdicts) {
+    runDecisionHook(options.onDecision, [request, verdict], "mcp", options.blockedHookLogger);
+  }
   if (batch.admissible) return proceed();
 
   runBlockedHook(
@@ -172,6 +201,8 @@ export function guardMcpToolHandler<T extends McpToolResult>(
       { name: toolName, arguments: args },
       () => handler(args, extra),
       options,
+      // The MCP SDK passes the invocation's AbortSignal through `extra`.
+      hostAbortSignal((extra as { signal?: unknown } | undefined)?.signal),
     );
 }
 

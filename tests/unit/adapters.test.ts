@@ -188,7 +188,7 @@ describe("LangChain adapter onBlocked (issue #102)", () => {
     assert.equal(infos[0]!.adapter, "langchain");
     assert.equal(infos[0]!.kind, "blocked");
     assert.equal(infos[0]!.reason, "per_tx_cap_exceeded");
-    assert.equal(infos[0]!.call.fn, "transfer");
+    assert.equal(infos[0]!.call?.fn, "transfer");
     assert.match(infos[0]!.explanation, /per-transaction cap/);
   });
 
@@ -275,7 +275,7 @@ describe("ElizaOS adapter onBlocked (issue #102)", () => {
     assert.equal(infos[0]!.adapter, "elizaos");
     assert.equal(infos[0]!.kind, "blocked");
     assert.equal(infos[0]!.reason, "per_tx_cap_exceeded");
-    assert.equal(infos[0]!.call.fn, "transfer");
+    assert.equal(infos[0]!.call?.fn, "transfer");
   });
 
   it("does not let a throwing hook change the false verdict, and stays silent by default", async () => {
@@ -534,7 +534,7 @@ describe("ordered call-batch mapping (issue #318)", () => {
       "every per-call verdict must be reported, in order",
     );
     assert.equal(blocked.length, 1);
-    assert.equal(blocked[0]!.call.fn, "transfer_from");
+    assert.equal(blocked[0]!.call?.fn, "transfer_from");
     assert.equal(blocked[0]!.calls?.length, 2);
     assert.equal(blocked[0]!.verdicts?.length, 2);
     assert.equal(blocked[0]!.verdicts?.[1]?.kind, "blocked");
@@ -581,7 +581,7 @@ describe("ordered call-batch mapping (issue #318)", () => {
       ["admissible", "blocked"],
     );
     assert.equal(infos.length, 1);
-    assert.equal(infos[0]!.call.fn, "transfer_from");
+    assert.equal(infos[0]!.call?.fn, "transfer_from");
     assert.equal(infos[0]!.calls?.length, 2);
   });
 

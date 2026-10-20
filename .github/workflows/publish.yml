@@ -41,6 +41,9 @@ jobs:
       - name: unit tests
         run: npm test
 
+      - name: build reviewed sources
+        run: npm run build
+
       # The tag is the source of truth for what should be released, so refuse to
       # proceed when it disagrees with package.json — publishing v0.2.0 from a
       # v0.1.0 tag is not recoverable.
@@ -54,7 +57,33 @@ jobs:
           fi
           echo "tag ${GITHUB_REF_NAME} matches package.json version ${version}"
 
+      # Pack once, hash the exact bytes, and publish that same tarball. The
+      # digest is public release evidence and contains no credentials.
+      - name: pack and record artifact digest
+        run: |
+          mkdir -p release-artifact
+          npm pack --ignore-scripts --json --pack-destination release-artifact > release-artifact/pack.json
+          tarball="$(node -e 'const fs=require("fs"); const value=JSON.parse(fs.readFileSync("release-artifact/pack.json", "utf8")); const item=Array.isArray(value) ? value[0] : Object.values(value)[0]; if (!item?.filename) process.exit(1); process.stdout.write(item.filename);')"
+          test -f "release-artifact/$tarball"
+          sha256sum "release-artifact/$tarball" | tee release-artifact/sha256.txt
+          echo "RELEASE_TARBALL=release-artifact/$tarball" >> "$GITHUB_ENV"
+          {
+            echo "## Published artifact integrity"
+            echo
+            echo "- package: stellar-agent-guard-sdk@$GITHUB_REF_NAME"
+            echo "- tarball: $tarball"
+            echo "- SHA-256: $(cut -d' ' -f1 release-artifact/sha256.txt)"
+            echo "- verification: sha256sum -c sha256.txt from the artifact directory"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: upload release integrity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-artifact-integrity
+          path: release-artifact/
+          if-no-files-found: error
+
       - name: publish
-        run: npm publish --access public
+        run: npm publish "$RELEASE_TARBALL" --access public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

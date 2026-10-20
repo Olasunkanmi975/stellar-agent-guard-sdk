@@ -20,8 +20,10 @@
  * validator returns `false` and the action is dropped from the eligible set,
  * exactly as for a `blocked` verdict. The difference between the two is
  * observable through `onDecision` (and `onBlocked`, which is called for both),
- * not through the return value. This is the documented contract the shared
- * verdict-fixture harness asserts against.
+ * not through the return value. A mapper that throws or returns a malformed
+ * call is the same fail-closed halt (issue #316): the validator returns `false`
+ * and `onBlocked` reports an `undetermined` halt. This is the documented
+ * contract the shared verdict-fixture harness asserts against.
  * Options are validated at construction time (see `src/adapters/validate.ts`):
  * a misconfigured adapter throws `AdapterConfigError` before any action runs,
  * rather than failing mid-loop on the first tool call.
@@ -35,12 +37,19 @@ import {
   validateContractMapping,
   validateInterceptor,
   validateOptionalFunction,
+  validateOptionalSignal,
+  validateOptionalTimeout,
   type AdapterConfigIssue,
 } from "./validate.ts";
 import {
   blockedInfoFor,
   blockedInfoForBatch,
+  checkOptionsFor,
+  mappingFailureFor,
+  normalizeMappedCall,
+  normalizeMappedCalls,
   runBlockedHook,
+  runDecisionHook,
   type BlockedHookLogger,
   type GuardBlockedHook,
 } from "./shared.ts";
@@ -92,6 +101,19 @@ export interface ElizaGuardOptions {
    * a throwing hook is silent (issue #314).
    */
   blockedHookLogger?: BlockedHookLogger;
+  /**
+   * Caller-owned cancellation, forwarded to every pre-flight `check()`
+   * (issue #315). ElizaOS's validator hook exposes no invocation signal, so
+   * this is the only cancellation channel; aborting yields `undetermined`,
+   * which the validator fails closed on.
+   */
+  signal?: AbortSignal | undefined;
+  /**
+   * Bound on each RPC call made by the pre-flight check, in milliseconds
+   * (issue #315); `0` disables it. A fired timeout yields the same fail-closed
+   * `undetermined` verdict as an abort.
+   */
+  timeoutMs?: number | undefined;
 }
 
 /**
@@ -118,6 +140,10 @@ export function createGuardValidator(options: ElizaGuardOptions): ElizaValidator
   if (onDecisionIssue) issues.push(onDecisionIssue);
   const onBlockedIssue = validateOptionalFunction("onBlocked", options.onBlocked);
   if (onBlockedIssue) issues.push(onBlockedIssue);
+  const signalIssue = validateOptionalSignal(options.signal);
+  if (signalIssue) issues.push(signalIssue);
+  const timeoutIssue = validateOptionalTimeout(options.timeoutMs);
+  if (timeoutIssue) issues.push(timeoutIssue);
   throwAdapterConfigError("elizaos", issues);
 
   return async (runtime, message, state, handlerOptions) => {
@@ -126,17 +152,25 @@ export function createGuardValidator(options: ElizaGuardOptions): ElizaValidator
       if (!baseOk) return false; // the action was not applicable in the first place
     }
 
-    const calls = options.toContractCalls
-      ? [...(options.toContractCalls(message, state) ?? [])]
-      : (() => {
-          const call = options.toContractCall?.(message, state) ?? null;
-          return call ? [call] : [];
-        })();
+    let calls: ContractCall[];
+    try {
+      calls = options.toContractCalls
+        ? normalizeMappedCalls(options.toContractCalls(message, state), "toContractCalls")
+        : normalizeMappedCall(options.toContractCall?.(message, state), "toContractCall");
+    } catch (error) {
+      // A mapper failure is a fail-closed halt, not an "applicable" action
+      // (issue #316): the runtime drops the action before its handler runs.
+      const failure = mappingFailureFor("elizaos", error);
+      runBlockedHook(options.onBlocked, failure.info, options.blockedHookLogger);
+      return false;
+    }
     if (calls.length === 0) return true; // not fund-moving; nothing for the guard to say
 
+    const checkOptions = checkOptionsFor(options);
+
     if (calls.length === 1) {
-      const decision = await options.interceptor.check(calls[0]!);
-      options.onDecision?.(decision);
+      const decision = await options.interceptor.check(calls[0]!, checkOptions);
+      runDecisionHook(options.onDecision, [decision], "elizaos", options.blockedHookLogger);
       if (decision.allowed) return true;
 
       runBlockedHook(
@@ -149,8 +183,10 @@ export function createGuardValidator(options: ElizaGuardOptions): ElizaValidator
 
     // Batch mapping: a single refusal drops the whole action before its handler
     // runs; every per-call verdict is reported through `onDecision`.
-    const batch = await options.interceptor.checkBatch(calls);
-    for (const verdict of batch.verdicts) options.onDecision?.(verdict);
+    const batch = await options.interceptor.checkBatch(calls, checkOptions);
+    for (const verdict of batch.verdicts) {
+      runDecisionHook(options.onDecision, [verdict], "elizaos", options.blockedHookLogger);
+    }
     if (batch.admissible) return true;
 
     runBlockedHook(

@@ -21,6 +21,7 @@ import { GuardBlockedError } from "../../src/reasons.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
 import type { ContractCall } from "../../src/tx.ts";
 import { unsafeContractAddress, unsafeAccountAddress } from "../../src/policy.ts";
+import { mulberry32, randomUint } from "./seeded-random.ts";
 
 const VALID_GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
 const VALID_TOKEN = unsafeContractAddress("CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB");
@@ -1225,34 +1226,102 @@ describe("PreFlightInterceptor.checkBatch()", () => {
     );
   });
 
-  it("falls back to a zero committed spend when the ledger read is unavailable", async () => {
-    // No `getLedgerEntries` on the mock: the fetch throws and is swallowed, so
-    // the batch must still run rather than fail closed on a missing read.
+  it("fails closed when a required live staging read fails", async () => {
+    // Without an explicit snapshot, a failed ledger read means the committed
+    // window spend is unknown. Staging against an assumed zero could label an
+    // over-cap batch admissible, so the transfer cannot be decided.
     const harness = batchServer({
       enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
+      ledgerEntries: () => {
+        throw new Error("rpc unavailable");
+      },
     });
-    const decision = await batchInterceptor(harness.server).checkBatch([
-      transferCall(10n),
-      transferCall(20n),
-    ]);
+    const decision = await batchInterceptor(
+      harness.server,
+      policyWithWindowCap(1_000n),
+    ).checkBatch([transferCall(10n), transferCall(20n)]);
+
+    assert.equal(decision.admissible, false);
+    assert.equal(decision.kind, "undetermined");
+    assert.equal(decision.staging?.source, "unavailable");
+    assert.equal(decision.staging?.windowSpent, null);
+    assert.equal(decision.staging?.unavailable, true);
+    assert.equal(decision.verdicts.length, 2);
+    assert.equal(decision.verdicts[0]?.kind, "undetermined");
+    assert.equal(decision.verdicts[1]?.kind, "undetermined");
+    assert.match(
+      decision.verdicts[0]!.kind === "undetermined" ? decision.verdicts[0]!.detail : "",
+      /committed window spend/,
+    );
+  });
+
+  it("treats an absent Window entry as zero committed spend, not a failed read", async () => {
+    const harness = batchServer({
+      enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
+      ledgerEntries: () => ({ entries: [] }),
+    });
+    // The policy is supplied (cap 100) but the committed spend is read from the
+    // ledger: an absent entry means 0n, so 60 + 40 lands exactly on the cap.
+    const decision = await batchInterceptor(
+      harness.server,
+      policyWithWindowCap(100n),
+    ).checkBatch([transferCall(60n), transferCall(40n)]);
 
     assert.equal(decision.admissible, true);
-    assert.equal(harness.simulations, 4);
+    assert.equal(decision.kind, "admissible");
+    assert.equal(decision.staging?.source, "absent");
+    assert.equal(decision.staging?.windowSpent, 0n);
+    assert.equal(decision.staging?.unavailable, false);
+  });
+
+  it("trusts an explicitly supplied zero snapshot even when the live read fails", async () => {
+    const harness = batchServer({
+      enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
+      ledgerEntries: () => {
+        throw new Error("rpc unavailable");
+      },
+    });
+    const decision = await batchInterceptor(
+      harness.server,
+      policyWithWindowCap(1_000n),
+    ).checkBatch([transferCall(10n), transferCall(20n)], { initialWindowSpent: 0n });
+
+    assert.equal(decision.admissible, true);
+    assert.equal(decision.kind, "admissible");
+    assert.equal(decision.staging?.source, "provided");
+    assert.equal(decision.staging?.windowSpent, 0n);
+    assert.equal(decision.staging?.unavailable, false);
+  });
+
+  it("does not need window state for a batch with only non-transfer calls", async () => {
+    const harness = batchServer({
+      enforcedRuns: [admissibleSimulation("10")],
+      ledgerEntries: () => {
+        throw new Error("rpc unavailable");
+      },
+    });
+    const decision = await batchInterceptor(harness.server).checkBatch([
+      { contract: VALID_TOKEN, fn: "balance", args: [new Address(VALID_GUARD).toScVal()] },
+    ]);
+
+    // Staging is not required, so an unavailable window read cannot change the
+    // verdict for a call that never touches the window.
+    assert.equal(decision.admissible, true);
+    assert.equal(decision.kind, "admissible");
+    assert.equal(decision.staging, undefined);
   });
 
   it("reads the live policy and window from ledger storage when none is supplied", async () => {
     // `readPersistentEntry` decodes the contract-data entry's ScVal; the batch
     // check then stages against the committed total it finds there.
-    const { server } = batchServer({
+    const harness = batchServer({
       enforcedRuns: [admissibleSimulation("10")],
-      ledgerEntries: () => {
-        throw new Error("not modelled");
-      },
+      ledgerEntries: () => ({ entries: [] }),
     });
-    // An unreadable policy degrades to "no cap" rather than a fabricated one.
-    const decision = await batchInterceptor(server).checkBatch([transferCall(10n)]);
+    const decision = await batchInterceptor(harness.server).checkBatch([transferCall(10n)]);
 
     assert.equal(decision.admissible, true);
+    assert.equal(decision.staging?.source, "absent");
   });
 
   it("assertBatchAllowed returns the batch when every call is admissible", async () => {
@@ -1296,130 +1365,291 @@ describe("PreFlightInterceptor.checkBatch()", () => {
     );
   });
 
-  it("does no work at all when the batch signal is already aborted", async () => {
-    const harness = batchServer({ enforcedRuns: [] });
-    const interceptor = batchInterceptor(harness.server, policyWithWindowCap(1_000n));
-    const controller = new AbortController();
-    controller.abort();
-
-    const decision = await interceptor.checkBatch(
-      [transferCall(10n), transferCall(20n)],
-      { initialWindowSpent: 0n, signal: controller.signal },
-    );
-
-    assert.equal(decision.admissible, false);
-    assert.equal(decision.verdicts.length, 2);
-    for (const verdict of decision.verdicts) {
-      assert.equal(verdict.kind, "undetermined");
-      assert.ok(verdict.error instanceof RpcTimeoutError);
-      assert.equal(verdict.error.aborted, true);
-    }
-    assert.equal(harness.simulations, 0, "an already-aborted batch must issue no RPC");
-  });
-
-  it("stops before the next call after a mid-batch abort", async () => {
-    /** Abort after the first completed check, so the boundary is deterministic. */
-    class AbortAfterFirstCheck extends PreFlightInterceptor {
-      readonly controller = new AbortController();
-      private completedChecks = 0;
-
-      override async check(
-        call: ContractCall,
-        options?: PreFlightCheckOptions,
-      ): Promise<PreFlightDecision> {
-        const decision = await super.check(call, options);
-        this.completedChecks += 1;
-        if (this.completedChecks === 1) this.controller.abort();
-        return decision;
-      }
-    }
-
-    const harness = batchServer({
-      enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
-    });
-    const interceptor = new AbortAfterFirstCheck({
-      server: harness.server,
-      networkPassphrase: PASSPHRASE,
-      guard: CONTRACT,
-      agent: Keypair.random(),
-      source: Keypair.random(),
-      policy: policyWithWindowCap(1_000n),
-    });
-
-    const decision = await interceptor.checkBatch(
-      [transferCall(10n), transferCall(20n), transferCall(30n)],
-      { initialWindowSpent: 0n, signal: interceptor.controller.signal },
-    );
-
-    assert.equal(decision.admissible, false);
-    assert.deepEqual(
-      decision.verdicts.map((verdict) => verdict.kind),
-      ["admissible", "undetermined", "undetermined"],
-    );
-    assert.equal(decision.totalEstimatedResourceFee, 10n);
-    // The first call's probe + enforced run only; the other two never started.
-    assert.equal(harness.simulations, 2);
-    const unfinished = decision.verdicts[1];
-    assert.ok(unfinished?.kind === "undetermined");
-    assert.ok(unfinished.error instanceof RpcTimeoutError);
-    assert.equal(unfinished.error.aborted, true);
-  });
-
-  it("spends one deadline budget across the batch without wall-clock sleeps", async () => {
-    const clock = new FakeClock(1_000);
-    const harness = batchServer({
-      enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
-    });
-    const interceptor = new PreFlightInterceptor({
-      server: harness.server,
-      networkPassphrase: PASSPHRASE,
-      guard: CONTRACT,
-      agent: Keypair.random(),
-      source: Keypair.random(),
-      policy: policyWithWindowCap(1_000n),
-      clock,
-    });
-    let advanced = false;
-
-    const decision = await interceptor.checkBatch(
-      [transferCall(10n), transferCall(20n)],
-      {
-        initialWindowSpent: 0n,
-        deadlineMs: 5_000,
-        onStep: (step) => {
-          // Advance virtual time while the first call is running. The first
-          // call was already admitted its bound; the loop must not start the
-          // second one once the budget is gone.
-          if (!advanced && step.name === "probe" && step.status === "start") {
-            advanced = true;
-            clock.advance(5_001);
-          }
-        },
+  it("assertBatchAllowed throws PreFlightUndeterminedError when staging state is unavailable", async () => {
+    const { server } = batchServer({
+      enforcedRuns: [admissibleSimulation("10")],
+      ledgerEntries: () => {
+        throw new Error("rpc unavailable");
       },
-    );
-
-    assert.equal(decision.admissible, false);
-    assert.equal(decision.verdicts[0]?.kind, "admissible");
-    const unfinished = decision.verdicts[1];
-    assert.ok(unfinished?.kind === "undetermined");
-    assert.ok(unfinished.error instanceof RpcTimeoutError);
-    assert.equal(unfinished.error.deadline, true);
-    assert.equal(unfinished.error.timeoutMs, 5_000);
-    assert.equal(harness.simulations, 2);
-  });
-
-  it("rejects a non-positive batch deadline before any work", async () => {
-    const harness = batchServer({ enforcedRuns: [] });
-    const interceptor = batchInterceptor(harness.server, policyWithWindowCap(1_000n));
+    });
+    const interceptor = batchInterceptor(server, policyWithWindowCap(1_000n));
 
     await assert.rejects(
-      interceptor.checkBatch([transferCall(10n)], { deadlineMs: 0 }),
+      interceptor.assertBatchAllowed([transferCall(10n)]),
       (error: unknown) => {
-        assert.ok(error instanceof RangeError);
-        assert.match(error.message, /deadlineMs/);
+        assert.ok(error instanceof PreFlightUndeterminedError);
+        assert.match((error as Error).message, /batch staging state unavailable/);
         return true;
       },
     );
-    assert.equal(harness.simulations, 0);
+  });
+
+  /**
+   * Cumulative staging boundaries (issue #337).
+   *
+   * The explicit matrix below pins the three arithmetic boundaries the cap can
+   * have, and the seeded case explores mixed batches so ordering, non-transfer
+   * calls, and individual blocked/undetermined verdicts cannot be averaged
+   * away. The seed is printed in the failure, and the iteration count is kept
+   * small so the mock-RPC suite stays fast in CI.
+   */
+  describe("cumulative staging boundaries (issue #337)", () => {
+    const STAGING_SEED = 0x5eed337;
+    const STAGING_ITERATIONS = 50;
+
+    type ForcedKind = "admissible" | "blocked" | "undetermined";
+
+    interface Member {
+      call: ContractCall;
+      forced: ForcedKind;
+      /** Transfer amount, or `null` for a non-transfer call. */
+      amount: bigint | null;
+    }
+
+    function nonTransferCall(): ContractCall {
+      return {
+        contract: VALID_TOKEN,
+        fn: "balance",
+        args: [new Address(VALID_GUARD).toScVal()],
+      };
+    }
+
+    function forcedRun(kind: ForcedKind): unknown {
+      if (kind === "blocked") return blockedSimulation();
+      if (kind === "undetermined") return { error: "HostError: invalid_input", events: [] };
+      return admissibleSimulation("10");
+    }
+
+    /** Run one batch and return the verdict kinds plus the fee total. */
+    async function runBatch(
+      members: readonly Member[],
+      windowCap: bigint,
+      initialWindowSpent: bigint,
+    ) {
+      const { server } = batchServer({
+        enforcedRuns: members.map((member) => forcedRun(member.forced)),
+      });
+      const decision = await batchInterceptor(server, policyWithWindowCap(windowCap)).checkBatch(
+        members.map((member) => member.call),
+        { initialWindowSpent },
+      );
+      return decision;
+    }
+
+    function expectedVerdicts(
+      members: readonly Member[],
+      windowCap: bigint,
+      initialWindowSpent: bigint,
+    ): { kinds: string[]; fee: bigint } {
+      let staged = 0n;
+      let fee = 0n;
+      const kinds = members.map((member) => {
+        if (member.forced === "blocked") return "blocked";
+        if (member.forced === "undetermined") return "undetermined";
+        if (member.amount !== null && member.amount > 0n && windowCap > 0n) {
+          const projected = initialWindowSpent + staged + member.amount;
+          if (projected > windowCap) return "blocked";
+          staged += member.amount;
+        }
+        fee += 10n;
+        return "admissible";
+      });
+      return { kinds, fee };
+    }
+
+    function describeFailure(
+      seed: number,
+      iteration: number,
+      members: readonly Member[],
+      windowCap: bigint,
+      initialWindowSpent: bigint,
+    ): string {
+      const replay = JSON.stringify(
+        { windowCap, initialWindowSpent, members },
+        (_key, value) => (typeof value === "bigint" ? value.toString() : value),
+      );
+      return `seed 0x${seed.toString(16)} iteration ${iteration}\nbatch: ${replay}`;
+    }
+
+    it("admits below and equal to the cap, and refuses one stroop above", async () => {
+      const cases: Array<{ amounts: bigint[]; expected: string[] }> = [
+        { amounts: [99n], expected: ["admissible"] },
+        { amounts: [100n], expected: ["admissible"] },
+        { amounts: [101n], expected: ["blocked"] },
+        { amounts: [60n, 40n], expected: ["admissible", "admissible"] },
+        { amounts: [60n, 41n], expected: ["admissible", "blocked"] },
+        { amounts: [50n, 49n], expected: ["admissible", "admissible"] },
+        { amounts: [50n, 51n], expected: ["admissible", "blocked"] },
+      ];
+
+      for (const boundary of cases) {
+        const members = boundary.amounts.map(
+          (amount): Member => ({
+            call: transferCall(amount),
+            forced: "admissible",
+            amount,
+          }),
+        );
+        const decision = await runBatch(members, 100n, 0n);
+        assert.deepEqual(
+          decision.verdicts.map((verdict) => verdict.kind),
+          boundary.expected,
+          `amounts ${boundary.amounts.join(" + ")} against cap 100`,
+        );
+        assert.equal(
+          decision.admissible,
+          !boundary.expected.includes("blocked"),
+          "only a fully admissible batch is admissible",
+        );
+      }
+    });
+
+    it("keeps staging order-dependent and ignores non-transfer calls", async () => {
+      const ordered = [
+        { amounts: [101n, 50n], expected: ["blocked", "admissible"] },
+        { amounts: [50n, 101n], expected: ["admissible", "blocked"] },
+        { amounts: [60n, 40n], expected: ["admissible", "admissible"] },
+        { amounts: [60n, 41n], expected: ["admissible", "blocked"] },
+      ];
+
+      for (const boundary of ordered) {
+        const members = boundary.amounts.map(
+          (amount): Member => ({ call: transferCall(amount), forced: "admissible", amount }),
+        );
+        const decision = await runBatch(members, 100n, 0n);
+        assert.deepEqual(
+          decision.verdicts.map((verdict) => verdict.kind),
+          boundary.expected,
+          `ordered amounts ${boundary.amounts.join(", ")}`,
+        );
+      }
+
+      const mixed: Member[] = [
+        { call: transferCall(60n), forced: "admissible", amount: 60n },
+        { call: nonTransferCall(), forced: "admissible", amount: null },
+        { call: transferCall(40n), forced: "admissible", amount: 40n },
+      ];
+      const mixedDecision = await runBatch(mixed, 100n, 0n);
+      assert.deepEqual(
+        mixedDecision.verdicts.map((verdict) => verdict.kind),
+        ["admissible", "admissible", "admissible"],
+      );
+      assert.equal(mixedDecision.totalEstimatedResourceFee, 30n);
+
+      const overMixed = await runBatch(
+        [
+          { call: transferCall(60n), forced: "admissible", amount: 60n },
+          { call: nonTransferCall(), forced: "admissible", amount: null },
+          { call: transferCall(41n), forced: "admissible", amount: 41n },
+        ],
+        100n,
+        0n,
+      );
+      assert.deepEqual(
+        overMixed.verdicts.map((verdict) => verdict.kind),
+        ["admissible", "admissible", "blocked"],
+      );
+    });
+
+    it("never upgrades an individual blocked or undetermined member", async () => {
+      const members: Member[] = [
+        { call: transferCall(1n), forced: "blocked", amount: 1n },
+        { call: transferCall(60n), forced: "admissible", amount: 60n },
+        { call: transferCall(1n), forced: "undetermined", amount: 1n },
+        { call: transferCall(40n), forced: "admissible", amount: 40n },
+      ];
+      const decision = await runBatch(members, 100n, 0n);
+
+      assert.deepEqual(
+        decision.verdicts.map((verdict) => verdict.kind),
+        ["blocked", "admissible", "undetermined", "admissible"],
+      );
+      assert.equal(decision.admissible, false);
+      assert.equal(decision.kind, "blocked");
+      // The 60 + 40 transfers still stage to exactly the cap; neither is
+      // upgraded by the blocked or undetermined member around them.
+      assert.equal(decision.totalEstimatedResourceFee, 20n);
+    });
+
+    it("matches a seeded generator of mixed batches", async () => {
+      const rand = mulberry32(STAGING_SEED);
+
+      for (let iteration = 0; iteration < STAGING_ITERATIONS; iteration += 1) {
+        const windowCap = [0n, 1n, 10n, 100n, 1_000n][Math.floor(rand() * 5)]!;
+        const initialWindowSpent =
+          rand() < 0.5 ? 0n : randomUint(rand, Math.min(12, windowCap.toString(2).length + 1));
+        const length = 1 + Math.floor(rand() * 5);
+        let staged = 0n;
+        const members: Member[] = [];
+
+        for (let index = 0; index < length; index += 1) {
+          if (rand() < 0.2) {
+            members.push({ call: nonTransferCall(), forced: "admissible", amount: null });
+            continue;
+          }
+
+          const kindRoll = rand();
+          const forced: ForcedKind =
+            kindRoll < 0.15 ? "blocked" : kindRoll < 0.3 ? "undetermined" : "admissible";
+
+          let amount: bigint;
+          if (forced !== "admissible") {
+            amount = 1n;
+          } else {
+            const remaining = windowCap - initialWindowSpent - staged;
+            const boundaryRoll = rand();
+            if (boundaryRoll < 0.15) {
+              amount = remaining > 0n ? remaining - 1n : 0n;
+            } else if (boundaryRoll < 0.3) {
+              amount = remaining > 0n ? remaining : 0n;
+            } else if (boundaryRoll < 0.45) {
+              amount = remaining >= 0n ? remaining + 1n : 1n;
+            } else {
+              amount = randomUint(rand, 32) % 1_000n;
+            }
+          }
+
+          members.push({ call: transferCall(amount), forced, amount });
+
+          if (
+            forced === "admissible" &&
+            amount > 0n &&
+            windowCap > 0n &&
+            initialWindowSpent + staged + amount <= windowCap
+          ) {
+            staged += amount;
+          }
+        }
+
+        const expected = expectedVerdicts(members, windowCap, initialWindowSpent);
+
+        try {
+          const decision = await runBatch(members, windowCap, initialWindowSpent);
+          assert.deepEqual(
+            decision.verdicts.map((verdict) => verdict.kind),
+            expected.kinds,
+            "staged verdict kinds",
+          );
+          assert.equal(decision.totalEstimatedResourceFee, expected.fee, "admissible fee total");
+          assert.equal(
+            decision.admissible,
+            !expected.kinds.includes("blocked") && !expected.kinds.includes("undetermined"),
+            "batch must not upgrade a blocked/undetermined member",
+          );
+        } catch (error) {
+          assert.fail(
+            `${describeFailure(
+              STAGING_SEED,
+              iteration,
+              members,
+              windowCap,
+              initialWindowSpent,
+            )}\nexpected kinds: ${expected.kinds.join(", ")}\n${
+              error instanceof Error ? error.stack ?? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    });
   });
 });

@@ -147,6 +147,27 @@ export class PolicyDecodeError extends GuardError {
 }
 
 /**
+ * An adapter's call mapper could not produce a contract call.
+ *
+ * `toContractCall`/`toContractCalls` is application code: when it throws, or
+ * returns something that is not a contract call, the adapter fails closed and
+ * reports an `undetermined` halt rather than letting the action through. The
+ * original failure is kept as `cause`, and `field` names the mapper to fix.
+ */
+export class AdapterMappingError extends GuardError {
+  /** The mapper option that failed. */
+  readonly field: "toContractCall" | "toContractCalls";
+
+  constructor(
+    message: string,
+    options: { field: "toContractCall" | "toContractCalls"; cause?: unknown },
+  ) {
+    super(message, causeOptions(options.cause));
+    this.field = options.field;
+  }
+}
+
+/**
  * An adapter was constructed with misconfigured options.
  *
  * This is a programmer error, not a policy refusal: it is thrown at

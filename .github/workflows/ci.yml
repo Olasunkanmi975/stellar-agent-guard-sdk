@@ -131,6 +131,15 @@ jobs:
       - name: export-map resolution (pack + install + import)
         run: npm run test:exports
 
+      # Install the packed tarball in a production-only consumer outside the
+      # workspace, then import the root and adapter exports and typecheck a
+      # typed invocation path against the declarations shipped in the tarball.
+      - name: clean packed-install consumer
+        run: npm run test:packed-install
+
+      - name: published-file-set check
+        run: npm run test:pack
+
       # Browser-consumer bundle-size canary (issue #145): the dashboard imports
       # the SDK client-side, so this number ships to every operator's browser.
       # esbuild is already in the dev tree (tsx's binary), so this adds no new

@@ -28,6 +28,7 @@ as the change — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - `validateAgentPublicKey()` and `isValidAgentPublicKey()`: agent signer identities are checked at construction and before signing. Supported forms are a checksum-valid `G…` StrKey and the raw 32-byte key as 64 hex characters; secret seeds and malformed values are rejected with a `SigningError` naming `signer.publicKey` (#295).
 - Structured retry metadata on every terminal `invoke()` outcome, `InvokeRetryError` and fee-bump-exhausted `BroadcastError`: `retry.attempts`, `maxAttempts`, `retried`, `exhausted`, `totalDelayMs`, the per-class `retries` list and the terminal failure. It contains no secrets, signatures, diagnostic payloads, hashes or XDR (#297).
 - `deadlineMs` and `clock` on `invoke()`: one overall time budget shared by discovery, signing, retries, broadcast and polling, with expiry reported as a fail-closed `RpcTimeoutError` carrying `deadline: true` (#298).
+- `signal` and `timeoutMs` on every framework adapter, forwarded to the pre-flight `check()`/`checkBatch()` — with a host invocation signal taking precedence where the hook exposes one (`guardMcpToolHandler`, the LangChain middleware, the Vercel AI tool wrapper) — plus the `AdapterMappingError` type describing a failed `toContractCall`/`toContractCalls` (#315).
 
 ### Changed
 
@@ -37,6 +38,8 @@ as the change — see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 - `recent()` on the telemetry listener and on `GuardEventRingBuffer` returns **detached snapshots**: the array, the events, their decoded `data`/`decision` and the opt-in `raw` payload are copies, so a consumer can no longer change the retained state by editing what it was handed (#344).
 - A heartbeat that the guard **refuses** is now reported as a failed beat (a typed `HeartbeatBlockedError` through `onError`) instead of being counted as an accepted beat (#340).
 - `invoke()` validates `retry`, `maxRetries`, `feeBump`, `pollAttempts`/`pollIntervalMs`, `timeoutMs` and `deadlineMs` before signing or any RPC, and rejects contradictory aliases with field-specific `RangeError`s. `maxRetries` now bounds the total attempts for every retryable class, not only fee bumps; a jitter sample outside `[0, 1)` is rejected instead of clamped (#296).
+- `PreFlightInterceptor.checkBatch()` now fails closed when a required policy or committed-window read fails: positive SAC transfers whose staging state is unavailable are reported `undetermined` (batch `kind: "undetermined"`) instead of being staged against an assumed zero. An explicit `initialWindowSpent` (including `0n`) remains a trusted caller snapshot, and an absent `Window` entry still means zero committed spend (#336).
+- `startHeartbeat()` skips stale cadence slots after a submission runs longer than one interval instead of firing the overdue backlog; each skipped slot is counted once in `missedBeats`, and the next beat waits for the next future deadline (#339).
 
 ### Deprecated
 
@@ -48,7 +51,11 @@ None.
 
 ### Fixed
 
+- Framework adapters fail closed when `toContractCall`/`toContractCalls` throws or returns a malformed call: the handler never runs and the halt is reported as an `undetermined` decision with `AdapterMappingError` as the cause. Returning `null` (or an empty array) still means "not fund-moving" and passes the action through untouched (#316).
+- Adapter observer hooks (`onDecision`, `onBlocked`) are isolated from their failures: a synchronous throw or a rejected promise is swallowed — reported to `blockedHookLogger` when one is supplied — so a failing sink can never resume a halted action, turn a pass into a refusal, or surface as an unhandled rejection (#313).
 - `startHeartbeat()` now validates its inputs before the scheduler exists: a negative or non-finite `maxSkewMs`, a grace window that is not a non-negative safe integer or bigint, a callback that is not callable, and an unusable retry budget are all rejected with an error naming the field — before the first beat, and before the grace window is read from the chain (#341).
+- `HeartbeatHandle.stop()` now requests cancellation of an in-flight submission through its context signal and can be bounded with `stop({ timeoutMs })` / `stopTimeoutMs`, so a custom transport that never settles can no longer hang shutdown indefinitely (#338).
+- `PreFlightInterceptor.checkBatch()` no longer swallows a failed policy/window read and continue staging with zero spend; a required unavailable snapshot now yields an `undetermined` batch verdict (#336).
 
 ### Security
 

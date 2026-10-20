@@ -42,11 +42,24 @@ npm test               # unit suite
 npm run build
 npm run test:exports   # packed tarball resolves every advertised export
 npm run test:pack      # packed tarball ships dist + metadata only (issue #49)
+npm run test:packed-install # clean production-only consumer installs the tarball
 ```
 
 Checklist:
 
 - [ ] All gates green on the release commit (not "green yesterday").
+- [ ] The exact packed artifact has a recorded SHA-256 digest. Verify it locally
+      against the tarball that will be published:
+
+      ```bash
+      mkdir -p /tmp/sags-release-pack
+      npm pack --ignore-scripts --pack-destination /tmp/sags-release-pack
+      sha256sum /tmp/sags-release-pack/stellar-agent-guard-sdk-*.tgz
+      ```
+
+      The publish workflow records the same digest in the run summary and as the
+      `release-artifact-integrity` workflow artifact, then publishes that exact
+      tarball. The digest contains no credentials or secret material.
 - [ ] Live-testnet evidence is fresh for the enforcement path: if the release
       contains changes to `src/tx.ts`, `src/invoke.ts`, `src/policy.ts`, or
       `src/preflight.ts`, a run of `npm run test:integration` with evidence in

@@ -34,6 +34,21 @@ export interface HeartbeatSubmission {
   outcome?: InvokeOutcome;
 }
 
+/**
+ * Cancellation contract handed to every submission attempt.
+ *
+ * `stop()` requests cancellation through `signal` before it starts waiting, so
+ * a custom transport can abandon its own pending work instead of making
+ * shutdown wait for a request it no longer needs. The signal is advisory: the
+ * scheduler still waits for the submission promise to settle (subject to
+ * `stop`'s optional deadline), because abandoning a promise cannot undo work
+ * that already reached the network.
+ */
+export interface HeartbeatSubmitContext {
+  /** Aborted when `stop()` begins. */
+  signal: AbortSignal;
+}
+
 /** One fired beat, as handed to `onBeat`. */
 export interface HeartbeatBeat {
   /** Epoch milliseconds the beat fired. */
@@ -151,17 +166,56 @@ export const DEFAULT_HEARTBEAT_RETRY_OPTIONS = {
   maxDelayMs: 5_000,
 } as const;
 
+/** Bounds for one `stop()` call. Both are optional; without either, stop is graceful and unbounded. */
+export interface HeartbeatStopOptions {
+  /**
+   * How long to wait for the in-flight submission (and the loop teardown)
+   * before returning. `stop()` always requests cancellation first; on a fired
+   * deadline it stops waiting and reports `reason: "timeout"`.
+   */
+  timeoutMs?: number;
+  /** Cancels the wait (not the scheduler, which `stop()` already stopped). */
+  signal?: AbortSignal;
+}
+
+/**
+ * What `stop()` observed. A graceful stop waits for the in-flight submission to
+ * settle; a bounded stop can return before that, and says so.
+ */
+export interface HeartbeatStopResult {
+  /**
+   * `completed` — the loop and any in-flight submission settled before the
+   * bound. `timeout` / `aborted` — `stop()` returned first; the submission was
+   * asked to cancel and its eventual result, if any, follows the normal
+   * `onBeat` / `onError` channels.
+   */
+  reason: "completed" | "timeout" | "aborted";
+  /** True when the submission (if one was in flight) settled before return. */
+  settled: boolean;
+  /** The in-flight submission's value when it settled successfully. */
+  submission?: HeartbeatSubmission | void;
+  /** The in-flight submission's terminal error when it settled with one. */
+  error?: unknown;
+}
+
 /** The running scheduler, returned by `startHeartbeat`. */
 export interface HeartbeatHandle {
   /**
-   * Stop the scheduler. Idempotent, and resolves once an in-flight beat has
-   * settled — so after `await stop()` no further submission can occur and none
-   * is in progress. No beat is scheduled or sent after the call.
+   * Stop the scheduler. Idempotent, and by default resolves once an in-flight
+   * beat has settled — so after `await stop()` no further submission can occur
+   * and none is in progress.
+   *
+   * Stopping first aborts the submission context's `signal` (a request to
+   * cancel) and then waits for the submission promise. Pass `timeoutMs` or a
+   * `signal` to bound that wait; when the bound fires, `stop()` returns with
+   * `reason: "timeout"` / `"aborted"` and `settled: false` instead of hanging
+   * on a transport that ignores cancellation. No beat is scheduled or sent
+   * after the call.
    */
-  stop(): Promise<void>;
+  stop(options?: HeartbeatStopOptions): Promise<HeartbeatStopResult>;
   /** Epoch ms of the last successfully submitted beat, or `null`. */
   readonly lastBeatAt: number | null;
-  /** Beats that fired later than `maxSkewMs`. */
+  /** Beats that fired later than `maxSkewMs` or whose cadence slots were skipped. */
   readonly missedBeats: number;
   /** True once stopped (by `stop()` or by the abort signal). */
   readonly stopped: boolean;
@@ -205,6 +259,8 @@ export interface SubmitHeartbeatParams {
   networkPassphrase?: string;
   pollAttempts?: number;
   pollIntervalMs?: number;
+  /** Cancellation forwarded to the underlying `invoke()` pipeline. */
+  signal?: AbortSignal;
 }
 
 export interface HeartbeatOptions {
@@ -272,9 +328,19 @@ export interface HeartbeatOptions {
 
   /**
    * Replace the submission step (testing seam, or a custom transport). Receives
-   * the beat and returns what committed. Defaults to `submitHeartbeat()`.
+   * the beat and a cancellation context whose `signal` aborts when `stop()`
+   * begins. Defaults to `submitHeartbeat()`.
    */
-  submit?: (beat: HeartbeatBeat) => Promise<HeartbeatSubmission | void>;
+  submit?: (
+    beat: HeartbeatBeat,
+    context: HeartbeatSubmitContext,
+  ) => Promise<HeartbeatSubmission | void>;
+  /**
+   * Default deadline for a graceful `stop()`. Omitted → `stop()` waits
+   * indefinitely for an in-flight submission (the pre-existing behaviour).
+   * `stop({ timeoutMs })` overrides it for one call.
+   */
+  stopTimeoutMs?: number;
   /** Clock seam (epoch ms). Defaults to `Date.now`. */
   now?: () => number;
   /** Wait seam. Defaults to an abortable `setTimeout`. */
@@ -325,6 +391,7 @@ export async function submitHeartbeat(params: SubmitHeartbeatParams): Promise<He
     guardAuth: { guard: unsafeContractAddress(params.guard), agent: params.signer },
     ...(params.pollAttempts !== undefined ? { pollAttempts: params.pollAttempts } : {}),
     ...(params.pollIntervalMs !== undefined ? { pollIntervalMs: params.pollIntervalMs } : {}),
+    ...(params.signal !== undefined ? { signal: params.signal } : {}),
   });
   const ledger = outcome.kind === "allowed" ? outcome.submission.ledger : null;
   return {
@@ -355,8 +422,8 @@ async function resolveGrace(
 
 function defaultSubmit(
   options: HeartbeatOptions,
-): (beat: HeartbeatBeat) => Promise<HeartbeatSubmission> {
-  return async () => {
+): (beat: HeartbeatBeat, context: HeartbeatSubmitContext) => Promise<HeartbeatSubmission> {
+  return async (_beat, context) => {
     if (!options.server) {
       throw new Error("startHeartbeat needs `server` (or an explicit `submit`) to send heartbeats");
     }
@@ -370,6 +437,7 @@ function defaultSubmit(
         : {}),
       ...(options.pollAttempts !== undefined ? { pollAttempts: options.pollAttempts } : {}),
       ...(options.pollIntervalMs !== undefined ? { pollIntervalMs: options.pollIntervalMs } : {}),
+      signal: context.signal,
     });
   };
 }
@@ -409,6 +477,14 @@ function assertHeartbeatOptions(options: HeartbeatOptions): void {
     if (!Number.isFinite(maxSkewMs) || maxSkewMs < 0) {
       throw new RangeError(
         `heartbeat maxSkewMs must be a finite, non-negative number, received ${maxSkewMs}`,
+      );
+    }
+  }
+  if (options.stopTimeoutMs !== undefined) {
+    const stopTimeoutMs = options.stopTimeoutMs;
+    if (!Number.isFinite(stopTimeoutMs) || stopTimeoutMs < 0) {
+      throw new RangeError(
+        `heartbeat stopTimeoutMs must be a finite, non-negative number, received ${stopTimeoutMs}`,
       );
     }
   }
@@ -517,6 +593,16 @@ type HeartbeatAttemptResult =
   | { ok: true; submission: HeartbeatSubmission | void }
   | { ok: false; error: unknown; retryable: boolean };
 
+/** The result of one beat, after any configured retries. */
+type BeatSubmissionResult =
+  | {
+      ok: true;
+      attempt: number;
+      ledger?: number;
+      submission: HeartbeatSubmission | void;
+    }
+  | { ok: false; attempt: number; error: unknown };
+
 /**
  * Run one submission attempt and classify what came back (issue #340).
  *
@@ -527,12 +613,13 @@ type HeartbeatAttemptResult =
  * not keep the dead-man switch alive.
  */
 async function attemptSubmission(
-  submit: (beat: HeartbeatBeat) => Promise<HeartbeatSubmission | void>,
+  submit: (beat: HeartbeatBeat, context: HeartbeatSubmitContext) => Promise<HeartbeatSubmission | void>,
   beat: HeartbeatBeat,
+  context: HeartbeatSubmitContext,
 ): Promise<HeartbeatAttemptResult> {
   let submission: HeartbeatSubmission | void;
   try {
-    submission = await submit(beat);
+    submission = await submit(beat, context);
   } catch (error) {
     return { ok: false, error, retryable: isRetryableHeartbeatFailure(error) };
   }
@@ -565,15 +652,27 @@ async function attemptSubmission(
  *
  * Beats are scheduled on a **fixed cadence from the start**, not "interval
  * after the previous beat finished", so a slow beat does not push every later
- * one; instead it shows up as lateness on the next. The first beat fires
- * immediately, so a freshly started agent registers without waiting a full
- * interval.
+ * one. A submission that outlives one or more slots does not trigger a
+ * catch-up burst: the stale slots are counted in `missedBeats` and the next
+ * beat waits for the next future deadline. The first beat fires immediately, so
+ * a freshly started agent registers without waiting a full interval.
  *
  * ## Lateness and failures
  *
  * A beat that fires more than `maxSkewMs` past its deadline increments
- * `missedBeats` and is reported through `onBeat`'s `lateMs`. A submission
+ * `missedBeats` and is reported through `onBeat`'s `lateMs`; every cadence slot
+ * skipped while a submission was in flight is counted too. A submission
  * failure goes to `onError` and never escapes as an unhandled rejection.
+ *
+ * ## Stopping
+ *
+ * `stop()` requests cancellation through the submission context's `signal` and
+ * then waits for the in-flight submission to settle, preserving graceful
+ * teardown. A custom transport that cannot guarantee settlement can be bounded
+ * with `stopTimeoutMs` or `stop({ timeoutMs })`; when that bound fires, stop
+ * returns `{ reason: "timeout", settled: false }` instead of hanging. The
+ * submission's eventual result, if it arrives, is reported through the usual
+ * `onBeat` / `onError` channels.
  *
  * ## Retries (issue #340)
  *
@@ -613,6 +712,12 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
   let missedBeats = 0;
   let lastBeatSecond: number | null = null;
   const controller = new AbortController();
+  // Submission cancellation is separate from the scheduler's wait controller:
+  // stopping always requests it, while the loop preserves graceful teardown.
+  const submissionController = new AbortController();
+  const submissionContext: HeartbeatSubmitContext = { signal: submissionController.signal };
+  let beatInFlight = false;
+  let lastBeatResult: BeatSubmissionResult | null = null;
 
   const external = options.signal;
   const onExternalAbort = () => {
@@ -628,13 +733,79 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
     resolveLoopDone = resolve;
   });
 
-  async function stop(): Promise<void> {
-    if (!stopped) {
-      stopped = true;
-      controller.abort();
-      external?.removeEventListener("abort", onExternalAbort);
+  let stopPromise: Promise<HeartbeatStopResult> | undefined;
+
+  function completedStopResult(inFlightAtStop: boolean): HeartbeatStopResult {
+    if (!inFlightAtStop || lastBeatResult === null) {
+      return { reason: "completed", settled: true };
     }
-    await loopDone;
+    if (lastBeatResult.ok) {
+      return {
+        reason: "completed",
+        settled: true,
+        submission: lastBeatResult.submission,
+      };
+    }
+    return { reason: "completed", settled: true, error: lastBeatResult.error };
+  }
+
+  function waitForStop(
+    stopOptions: HeartbeatStopOptions | undefined,
+    inFlightAtStop: boolean,
+  ): Promise<HeartbeatStopResult> {
+    const timeoutMs = stopOptions?.timeoutMs ?? options.stopTimeoutMs;
+    const signal = stopOptions?.signal;
+
+    if (signal?.aborted) {
+      return Promise.resolve({ reason: "aborted", settled: false });
+    }
+    if (timeoutMs === undefined && signal === undefined) {
+      return loopDone.then(() => completedStopResult(inFlightAtStop));
+    }
+
+    return new Promise<HeartbeatStopResult>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const cleanup = () => {
+        if (timer !== undefined) clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+      };
+      const finish = (result: HeartbeatStopResult) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(result);
+      };
+      const onAbort = () => finish({ reason: "aborted", settled: false });
+
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (timeoutMs !== undefined) {
+        timer = setTimeout(() => finish({ reason: "timeout", settled: false }), timeoutMs);
+      }
+      loopDone.then(() => finish(completedStopResult(inFlightAtStop)));
+    });
+  }
+
+  function stop(stopOptions?: HeartbeatStopOptions): Promise<HeartbeatStopResult> {
+    if (stopOptions?.timeoutMs !== undefined) {
+      const timeoutMs = stopOptions.timeoutMs;
+      if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+        return Promise.reject(
+          new RangeError(
+            `heartbeat stop timeoutMs must be a finite, non-negative number, received ${timeoutMs}`,
+          ),
+        );
+      }
+    }
+    if (stopPromise) return stopPromise;
+
+    const inFlightAtStop = beatInFlight;
+    stopped = true;
+    controller.abort();
+    submissionController.abort();
+    external?.removeEventListener("abort", onExternalAbort);
+    stopPromise = waitForStop(stopOptions, inFlightAtStop);
+    return stopPromise;
   }
 
   /**
@@ -646,21 +817,18 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
    * through `onWarning`, and the failure that ends the beat is returned to
    * the caller, which reports it through `onError`.
    */
-  async function submitBeat(
-    beat: HeartbeatBeat,
-  ): Promise<
-    { ok: true; attempt: number; ledger?: number } | { ok: false; attempt: number; error: unknown }
-  > {
+  async function submitBeat(beat: HeartbeatBeat): Promise<BeatSubmissionResult> {
     let attempt = 0;
     for (;;) {
       attempt += 1;
-      const result = await attemptSubmission(submit, beat);
+      const result = await attemptSubmission(submit, beat, submissionContext);
       if (result.ok) {
         const ledger = result.submission?.ledger;
         return {
           ok: true,
           attempt,
           ...(ledger !== undefined ? { ledger } : {}),
+          submission: result.submission,
         };
       }
       // A policy block (or a failure the SDK cannot classify) is final, and so
@@ -688,6 +856,20 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
 
   async function run(): Promise<void> {
     let deadline = now();
+
+    // A submission can outlive several cadence slots. Advance over every slot
+    // that is already stale instead of firing the backlog back-to-back; each
+    // skipped slot is counted once for `missedBeats`.
+    const skipExpiredSlots = (): void => {
+      const current = now();
+      if (deadline > current) return;
+      // Count the whole stale range arithmetically so a large clock jump cannot
+      // spin the loop once per skipped slot.
+      const skipped = Math.floor((current - deadline) / intervalMs) + 1;
+      deadline += skipped * intervalMs;
+      missedBeats += skipped;
+    };
+
     while (!stopped) {
       await wait(Math.max(0, deadline - now()), controller.signal);
       if (stopped) break;
@@ -695,6 +877,7 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
       const at = now();
       const lateMs = Math.max(0, at - deadline);
       deadline += intervalMs;
+      skipExpiredSlots();
 
       const second = Math.floor(at / 1000);
       if (lastBeatSecond !== null && second === lastBeatSecond) {
@@ -705,7 +888,12 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
 
       if (lateMs > maxSkewMs) missedBeats += 1;
 
+      beatInFlight = true;
       const result = await submitBeat({ at, lateMs });
+      beatInFlight = false;
+      lastBeatResult = result;
+      skipExpiredSlots();
+
       if (stopped) break;
 
       if (!result.ok) {
@@ -735,8 +923,9 @@ export async function startHeartbeat(options: HeartbeatOptions): Promise<Heartbe
 
   if (external?.aborted) {
     stopped = true;
+    submissionController.abort();
     return {
-      stop: async () => {},
+      stop: async () => ({ reason: "completed", settled: true }),
       get lastBeatAt() {
         return null;
       },

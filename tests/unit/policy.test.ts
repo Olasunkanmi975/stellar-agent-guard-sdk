@@ -12,7 +12,9 @@ import { readFile } from "node:fs/promises";
 import { resolve } from "node:path";
 import { describe, it } from "node:test";
 import { Address, nativeToScVal, scValToNative, StrKey, xdr } from "@stellar/stellar-sdk";
+import { mulberry32, randomUint } from "./seeded-random.ts";
 import { PolicyDecodeError } from "../../src/errors.ts";
+import { POLICY_JSON_VERSION, policyFromJson, policyToJson } from "../../src/policy-json.ts";
 import type { CheckResult } from "../../src/policy.ts";
 import {
   decodeCheckResult,
@@ -355,6 +357,49 @@ describe("decodePolicy", () => {
         assert.equal(error.path, "assets[0]");
         return true;
       },
+    );
+  });
+});
+
+describe("policy JSON codec", () => {
+  it("round-trips every policy field without floating-point conversion", () => {
+    const policy = samplePolicy({
+      per_tx_cap: 9_007_199_254_740_993n,
+      window_secs: 2n ** 64n - 1n,
+      window_cap: -(2n ** 127n),
+      active_from: 123n,
+      active_until: 2n ** 64n - 1n,
+      dms_grace_secs: 456n,
+      recipient_window_caps: [{ recipient: RECIPIENT, cap: 987_654_321_012_345_678n }],
+      blocked_recipients: [RECIPIENT],
+    });
+    const encoded = policyToJson(policy);
+
+    assert.equal(encoded.version, POLICY_JSON_VERSION);
+    assert.equal(encoded.per_tx_cap, "9007199254740993");
+    assert.equal(typeof encoded.window_cap, "string");
+    assert.deepEqual(policyFromJson(JSON.stringify(encoded)), policy);
+    assert.deepEqual(policyFromJson(encoded), policy);
+  });
+
+  it("rejects numeric bigint fields, unknown fields, and out-of-range values with paths", () => {
+    const encoded = policyToJson(samplePolicy()) as unknown as Record<string, unknown>;
+
+    assert.throws(
+      () => policyFromJson({ ...encoded, per_tx_cap: 1 }),
+      (error: unknown) => error instanceof PolicyDecodeError && error.path === "policy.per_tx_cap",
+    );
+    assert.throws(
+      () => policyFromJson({ ...encoded, unknown: true }),
+      (error: unknown) => error instanceof PolicyDecodeError && error.path === "policy.unknown",
+    );
+    assert.throws(
+      () => policyFromJson({ ...encoded, window_secs: (2n ** 64n).toString() }),
+      (error: unknown) => error instanceof PolicyDecodeError && error.path === "policy.window_secs",
+    );
+    assert.throws(
+      () => policyFromJson({ ...encoded, protocols: [{ contract: TOKEN, fns: [], extra: true }] }),
+      (error: unknown) => error instanceof PolicyDecodeError && error.path === "policy.protocols[0].extra",
     );
   });
 });
@@ -1444,33 +1489,12 @@ const PROTOCOL_FN_POOL = [
   "withdraw",
 ] as const;
 
-/** Deterministic PRNG — same stream on every CI run and every local replay. */
-function mulberry32(seed: number): () => number {
-  let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6d2b79f5) | 0;
-    let t = Math.imul(state ^ (state >>> 15), 1 | state);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
-}
-
 function randomBytes(rand: () => number, length: number): Buffer {
   const bytes = Buffer.allocUnsafe(length);
   for (let index = 0; index < length; index += 1) {
     bytes[index] = Math.floor(rand() * 256);
   }
   return bytes;
-}
-
-/** A `bits`-wide unsigned bigint drawn from `rand`, exactly in `[0, 2**bits - 1]`. */
-function randomUint(rand: () => number, bits: number): bigint {
-  let value = 0n;
-  for (let remaining = bits; remaining > 0; remaining -= 32) {
-    value = (value << 32n) | BigInt(Math.floor(rand() * 0x1_0000_0000));
-  }
-  const excess = (32 - (bits % 32)) % 32;
-  return excess === 0 ? value : value >> BigInt(excess);
 }
 
 /** An i128 amount in `[0, 2**127 - 1]`, occasionally pinned to its boundary. */

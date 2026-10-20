@@ -14,6 +14,10 @@
  * - **Structural, not a dependency.** A host passes any object with the four
  *   levels; `console` itself satisfies the interface, as does a pino/winston
  *   child logger.
+ * - **Redacted by default.** SDK-owned metadata is copied before delivery and
+ *   fields that commonly contain keys, signer output, caller arguments, or raw
+ *   RPC payloads are omitted. Public errors, callbacks, and telemetry are not
+ *   mutated; this boundary only controls what the logger receives.
  * - **Never fatal.** A logger that throws — or a level the host did not
  *   implement — cannot change an outcome, break a pipeline stage, or surface as
  *   an error. Observability is advisory, the same way `onStep` and `onGap` are.
@@ -25,10 +29,48 @@
  *
  * Deliberately loose: the SDK does not dictate a schema to the host, and a
  * host that ignores `meta` still gets a complete one-line message. Values are
- * passed through as-is — `bigint` fee amounts are rendered as strings by the
- * emitters, because a JSON logger cannot serialise a `bigint`.
+ * copied and redacted at the logger boundary; `bigint` fee amounts are
+ * rendered as strings, because a JSON logger cannot serialise a `bigint`.
  */
 export type GuardLogMeta = Record<string, unknown>;
+
+const SENSITIVE_META_KEY = /(?:private|secret|signer|signature|raw|diagnostic|payload|argument|args)/i;
+
+/**
+ * Copy logger metadata while removing fields that are unsafe to forward by
+ * default. This is intentionally a logger-only transform: callers still get
+ * the original errors, callbacks, and `includeRaw` telemetry payloads.
+ */
+export function redactLogMeta(meta: GuardLogMeta | undefined): GuardLogMeta | undefined {
+  if (meta === undefined) return undefined;
+  return sanitizeLogValue(meta, new WeakSet<object>(), 0) as GuardLogMeta;
+}
+
+function sanitizeLogValue(value: unknown, seen: WeakSet<object>, depth: number): unknown {
+  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
+    return value;
+  }
+  if (typeof value === "bigint") return value.toString();
+  if (typeof value === "function") return undefined;
+  if (depth >= 8) return "[redacted: metadata depth limit]";
+  if (value instanceof Uint8Array) return "[redacted: binary payload]";
+  if (value instanceof Error) return { name: value.name, message: value.message };
+  if (typeof value !== "object") return String(value);
+  if (seen.has(value)) return "[redacted: circular metadata]";
+  seen.add(value);
+  if (Array.isArray(value)) {
+    return value
+      .map((item) => sanitizeLogValue(item, seen, depth + 1))
+      .filter((item): item is unknown => item !== undefined);
+  }
+  const copy: Record<string, unknown> = {};
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (SENSITIVE_META_KEY.test(key)) continue;
+    const safe = sanitizeLogValue(item, seen, depth + 1);
+    if (safe !== undefined) copy[key] = safe;
+  }
+  return copy;
+}
 
 /**
  * The four levels the SDK emits on.
@@ -98,7 +140,7 @@ function bindLevel(
   if (typeof sink !== "function") return noop;
   return (message: string, meta?: GuardLogMeta): void => {
     try {
-      sink.call(input, message, meta);
+      sink.call(input, message, redactLogMeta(meta));
     } catch {
       /* advisory only: a broken sink must not decide whether a transaction runs */
     }

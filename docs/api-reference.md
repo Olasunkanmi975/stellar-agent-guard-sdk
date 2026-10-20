@@ -9,6 +9,8 @@ The Stellar Agent Guard SDK exposes the following public surface. For the narrat
 - `PreFlightInterceptor`
   - `constructor(options: PreFlightInterceptorOptions)` — Pass `cache: { ttlMs }` or `cache: { ttlLedgers }` to opt into the short-lived cache; omit it for fresh simulations.
   - `check(call: ContractCall): Promise<PreFlightDecision>` — Returns `admissible | blocked | undetermined` without throwing or broadcasting.
+  - `checkBatch(calls: ContractCall[], options?: CheckBatchOptions): Promise<PreFlightBatchDecision>` — Stages SAC transfer amounts against the committed window, with an `undetermined` batch verdict when a required policy/window read fails. An explicit `initialWindowSpent: 0n` is a trusted snapshot; a failed read is not treated as zero. `staging.source` reports `provided | ledger | absent | unavailable`.
+  - `assertBatchAllowed(calls, options?): Promise<PreFlightBatchDecision>` — Throws `GuardBlockedError` for a blocked member or `PreFlightUndeterminedError` for an undetermined member or unavailable staging state.
   - `assertAllowed(call: ContractCall): Promise<AdmissibleDecision>` — Asserts allowed or throws `GuardBlockedError`.
   - `invalidate(call?: ContractCall): void` — Clears all cached decisions or only entries for one call.
 - `CostPreChecker`
@@ -16,8 +18,8 @@ The Stellar Agent Guard SDK exposes the following public surface. For the narrat
   - `check(call: ContractCall): Promise<CostPreCheckResult>` — Returns `within_budget | over_budget | blocked | undetermined`.
   - `checkWithCost(call: ContractCall): Promise<{ decision, cost }>` — Returns the interceptor verdict and the cost of the **same** single simulation. Prefer this over calling `check()` on both classes.
 - `invoke(options: InvokeOptions): Promise<InvokeResult>` — End-to-end pipeline: probe, sign auth, simulate, and broadcast. Accepts an optional `onStep(step: InvokeStepEvent)` hook reporting per-stage `start`/`ok`/`fail` timing events with a 0-based retry `attempt` index; callback exceptions are isolated and omitting the hook changes nothing.
-- `startHeartbeat(options): Promise<HeartbeatHandle>` — Drift-aware dead-man keep-alive. Fires `heartbeat()` on an interval, reports lateness (`handle.missedBeats`, `onBeat`'s `lateMs`), routes every failure to `onError`, validates `interval <= grace/3` before the first beat when the grace window is readable, and stops cleanly (`await handle.stop()`). See “Keep the dead-man switch alive”.
-- `submitHeartbeat(params): Promise<HeartbeatSubmission>` — Signs and submits a single `heartbeat()` with the agent's guard authorization; the default submission `startHeartbeat` uses.
+- `startHeartbeat(options): Promise<HeartbeatHandle>` — Drift-aware dead-man keep-alive. Fires `heartbeat()` on an interval, reports lateness (`handle.missedBeats`, `onBeat`'s `lateMs`), routes every failure to `onError`, validates `interval <= grace/3` before the first beat when the grace window is readable, and stops cleanly (`await handle.stop()`). `stop()` requests cancellation through the submission context and waits for the in-flight beat; `stop({ timeoutMs })` / `stopTimeoutMs` bound that wait and return `{ reason, settled, submission?, error? }`. A submission that outlives several cadence slots skips the stale slots instead of firing a catch-up burst. See “Keep the dead-man switch alive”.
+- `submitHeartbeat(params): Promise<HeartbeatSubmission>` — Signs and submits a single `heartbeat()` with the agent's guard authorization; the default submission `startHeartbeat` uses. Accepts an optional `signal` forwarded to the underlying `invoke()` pipeline.
 - `HeartbeatIntervalError` — Thrown before the first beat when the requested interval exceeds `grace / 3`.
 - `HeartbeatBlockedError` — The guard refused the heartbeat. A refusal is a decision, not a transport failure, so it is never retried (issue #340).
 - `isRetryableHeartbeatFailure(error): boolean` — True only for the transport failures a bounded retry can plausibly fix: a `BroadcastError`, an `RpcTimeoutError`, a `SimulationError`. A policy refusal and an unclassifiable error are both `false` (issue #340).
@@ -31,6 +33,7 @@ The Stellar Agent Guard SDK exposes the following public surface. For the narrat
 | --- | --- | --- |
 | `intervalMs` | a positive, finite number | `0`, negatives, `NaN`, `Infinity` (`RangeError`) |
 | `maxSkewMs` | a finite, non-negative number | negatives, `NaN`, `±Infinity` (`RangeError`) |
+| `stopTimeoutMs` | a finite, non-negative number | negatives, `NaN`, `±Infinity` (`RangeError`) |
 | `graceSecs` | a non-negative `bigint`, or a non-negative **safe integer** | negatives, fractions, `NaN`, `±Infinity`, values beyond `Number.MAX_SAFE_INTEGER` (`RangeError`); a non-number, non-bigint (`TypeError`) |
 | `onBeat`, `onError`, `onWarning`, `readPolicy`, `submit`, `now`, `wait` | a function | anything else (`TypeError`) |
 | `retry.maxAttempts` | an integer `>= 1` | `0`, negatives, fractions (`RangeError`) |
@@ -59,6 +62,22 @@ const hb = await startHeartbeat({
 - The attempt that failed and the delay before the next one are announced through `onWarning`; the failure that ends the beat is reported **once** through `onError`, with the original error. Nothing escapes as an unhandled rejection.
 - A successful beat reports how many attempts it took in `onBeat`'s `attempt`.
 - The backoff uses the same abortable wait as the cadence, so `stop()` (or an abort) ends it at once and starts no further attempt.
+
+#### Stopping with an in-flight submission (issue #338)
+
+`submit(beat, { signal })` receives an `AbortSignal` that `stop()` aborts before it starts waiting. The default stop is still graceful: it waits for the submission promise to settle, so a transport that honours the signal shuts down promptly. A transport that may never settle can be bounded:
+
+```ts
+const result = await hb.stop({ timeoutMs: 5_000 });
+// { reason: "completed" | "timeout" | "aborted", settled: boolean,
+//   submission?: HeartbeatSubmission, error?: unknown }
+```
+
+`stop()` is idempotent: every call returns the same shared result. On a graceful settle the in-flight submission's value or terminal error is returned; on `timeout`/`aborted`, the submission has already been asked to cancel and any eventual result follows the normal `onBeat` / `onError` channels. Set `stopTimeoutMs` on `startHeartbeat` to apply a default bound to `stop()` (including an abort-signal shutdown).
+
+#### Skipping stale cadence slots (issue #339)
+
+The heartbeat loop keeps a fixed cadence. When a submission outlives one or more intervals, the stale slots are skipped instead of being fired back-to-back: each is counted once in `handle.missedBeats`, and the next beat waits for the next future deadline. A late wake still reports `lateMs` relative to the slot the beat represents. The same-second duplicate courtesy and the contract's own authority are unchanged.
 
 #### Fee units: stroops and XLM
 
@@ -142,6 +161,7 @@ one-shot form.
 - `policyToScVal(policy: PolicyConfig): xdr.ScVal` — Encodes a policy as the contract's canonical sorted ScVal struct.
 - `decodePolicy(scVal: xdr.ScVal): PolicyConfig` — Strictly decodes `policy()`/set-policy ScVal data, including Option/Vec and numeric normalization.
 - `policyFromScVal(scVal)` — Alias for callers using the issue's original function name.
+- `policyToJson(policy)` / `policyFromJson(value)` — Versioned, lossless in-memory JSON shape. All integer fields are decimal strings, and parsing rejects numbers, unknown fields, invalid addresses, and values outside their `u64`/`i128` ranges with a `PolicyDecodeError` field path. `encodePolicyJson` / `decodePolicyJson` are equivalent aliases. This is a persistence/transport shape, not ScVal encoding.
 - `describePolicy(policy: PolicyConfig | null, options?: DescribePolicyOptions): string` — A compact, log-friendly rendering of the policy in force. See [Describing a policy](#describing-a-policy-issue-343).
 - `invoke(options)` / `invoke({ ...options, dryRun: true })` — Broadcasts an admissible result, or returns the full pre-broadcast dry-run trace.
 - `verifyAgentSignature(publicKey, payload, signature): boolean` — Verify-only Ed25519 check against a strkey or raw 32-byte key.

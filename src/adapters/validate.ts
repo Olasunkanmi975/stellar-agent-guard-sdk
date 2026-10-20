@@ -120,6 +120,41 @@ export function validateInterceptor(value: unknown): AdapterConfigIssue | undefi
 }
 
 /**
+ * An optional `AbortSignal` forwarded to the pre-flight check (issue #315).
+ * Duck-typed, so any `AbortSignal` (Node, browser, a polyfill) is accepted.
+ */
+export function validateOptionalSignal(value: unknown): AdapterConfigIssue | undefined {
+  if (value === undefined) return undefined;
+  const candidate = value as { aborted?: unknown; addEventListener?: unknown } | null;
+  if (
+    candidate !== null &&
+    typeof candidate === "object" &&
+    typeof candidate.aborted === "boolean" &&
+    typeof candidate.addEventListener === "function"
+  ) {
+    return undefined;
+  }
+  return {
+    field: "signal",
+    expected: "an AbortSignal when provided",
+    message: `\`signal\` must be an AbortSignal when provided (got ${describeValue(value)}).`,
+  };
+}
+
+/** An optional per-RPC timeout forwarded to the pre-flight check (issue #315). */
+export function validateOptionalTimeout(value: unknown): AdapterConfigIssue | undefined {
+  if (value === undefined) return undefined;
+  if (typeof value === "number" && Number.isFinite(value) && value >= 0) return undefined;
+  return {
+    field: "timeoutMs",
+    expected: "a finite, non-negative number of milliseconds when provided",
+    message: `\`timeoutMs\` must be a finite, non-negative number of milliseconds when provided (got ${describeValue(
+      value,
+    )}).`,
+  };
+}
+
+/**
  * A batch-capable interceptor: the adapters call `checkBatch(...)` when a
  * `toContractCalls` mapper produces more than one call.
  */

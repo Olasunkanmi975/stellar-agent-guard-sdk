@@ -214,7 +214,9 @@ describe("startHeartbeat", () => {
 
     assert.equal(beats[1]!.at, 5000);
     assert.equal(beats[1]!.lateMs, 4000);
-    assert.equal(handle.missedBeats, 1, "a beat past maxSkewMs counts as missed");
+    // The beat is late by four slots and the slots it passed over are skipped
+    // rather than fired as a catch-up burst.
+    assert.equal(handle.missedBeats, 5, "one late beat plus four skipped cadence slots");
 
     await handle.stop();
   });
@@ -735,5 +737,228 @@ describe("startHeartbeat input validation (issue #341)", () => {
     );
     assert.equal(submissions, 0, "no beat may be submitted");
     assert.equal(policyReads, 0, "and the grace window must not even be read");
+  });
+
+  it("rejects an unusable stopTimeoutMs", async () => {
+    for (const stopTimeoutMs of [Number.NaN, Number.POSITIVE_INFINITY, -1]) {
+      await assert.rejects(
+        startHeartbeat(baseOptions({ stopTimeoutMs })),
+        (error: unknown) =>
+          error instanceof RangeError && /stopTimeoutMs/.test((error as Error).message),
+      );
+    }
+  });
+});
+
+/**
+ * Stopping with an in-flight submission (issue #338).
+ *
+ * A custom submit function can outlive the scheduler. `stop()` requests
+ * cancellation through the submission context and, by default, still waits for
+ * the promise to settle; a caller that cannot trust its transport can put a
+ * deadline on that wait and learn from the result that the submission was not
+ * settled when `stop()` returned.
+ */
+describe("startHeartbeat stop contract (issue #338)", () => {
+  it("requests cancellation and waits for an in-flight submission to settle", async () => {
+    const clock = fakeClock();
+    let submissions = 0;
+    let context: { signal: AbortSignal } | undefined;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now: clock.now,
+        wait: clock.wait,
+        submit: (_beat, submitContext) => {
+          submissions += 1;
+          context = submitContext;
+          return new Promise((_resolve, reject) => {
+            submitContext.signal.addEventListener(
+              "abort",
+              () => reject(new Error("cancelled by stop")),
+              { once: true },
+            );
+          });
+        },
+      }),
+    );
+
+    await clock.tick();
+    assert.equal(submissions, 1, "the first beat is in flight");
+    assert.equal(context?.signal.aborted, false);
+
+    const result = await handle.stop();
+
+    assert.equal(context?.signal.aborted, true, "stop requests cancellation first");
+    assert.equal(result.reason, "completed");
+    assert.equal(result.settled, true);
+    assert.ok(result.error instanceof Error);
+    assert.match(result.error.message, /cancelled by stop/);
+    assert.equal(handle.stopped, true);
+  });
+
+  it("returns at its deadline when a custom submit never settles", async () => {
+    const clock = fakeClock();
+    let context: { signal: AbortSignal } | undefined;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now: clock.now,
+        wait: clock.wait,
+        submit: (_beat, submitContext) => {
+          context = submitContext;
+          return new Promise<never>(() => {});
+        },
+      }),
+    );
+
+    await clock.tick();
+    const result = await handle.stop({ timeoutMs: 20 });
+
+    assert.equal(result.reason, "timeout");
+    assert.equal(result.settled, false);
+    assert.equal(context?.signal.aborted, true, "the submission was still asked to cancel");
+    assert.equal(handle.stopped, true);
+  });
+
+  it("uses stopTimeoutMs as the default bound and is idempotent", async () => {
+    const clock = fakeClock();
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now: clock.now,
+        wait: clock.wait,
+        stopTimeoutMs: 20,
+        submit: () => new Promise<never>(() => {}),
+      }),
+    );
+
+    await clock.tick();
+    const first = handle.stop();
+    const second = handle.stop();
+    assert.equal(first, second, "stop is one shared operation");
+
+    const [a, b] = await Promise.all([first, second]);
+    assert.deepEqual(a, b);
+    assert.equal(a.reason, "timeout");
+    assert.equal(a.settled, false);
+
+    const after = handle.stop();
+    assert.equal(after, first, "a later stop returns the same settled result");
+    assert.deepEqual(await after, a);
+  });
+
+  it("rejects a negative stop deadline without stopping the scheduler", async () => {
+    const clock = fakeClock();
+    const handle = await startHeartbeat(
+      baseOptions({ now: clock.now, wait: clock.wait }),
+    );
+
+    await assert.rejects(handle.stop({ timeoutMs: -1 }), RangeError);
+    assert.equal(handle.stopped, false, "an invalid stop call must not tear the scheduler down");
+
+    await handle.stop();
+    assert.equal(handle.stopped, true);
+  });
+});
+
+/**
+ * Stale cadence slots after a slow submission (issue #339).
+ *
+ * A beat that takes longer than several intervals used to leave the fixed
+ * deadline behind, so the loop immediately fired the whole overdue backlog. The
+ * scheduler now skips the stale slots, counts them once, and waits for the next
+ * future deadline.
+ */
+describe("startHeartbeat stale cadence slots (issue #339)", () => {
+  it("skips the slots a long submission passed and does not fire a catch-up burst", async () => {
+    const clock = fakeClock();
+    const beats: HeartbeatBeat[] = [];
+    let submissions = 0;
+    let release: (() => void) | undefined;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        intervalMs: 1_000,
+        maxSkewMs: 100,
+        now: clock.now,
+        wait: clock.wait,
+        submit: async () => {
+          submissions += 1;
+          if (submissions === 1) {
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+          }
+          return {};
+        },
+        onBeat: (beat) => beats.push(beat),
+      }),
+    );
+
+    await clock.tick(); // t=0: first beat starts and stays in flight
+    assert.equal(submissions, 1);
+
+    // The submission takes 5.5 intervals. Slots 1000…5000 are stale by the
+    // time it settles; the next beat must be scheduled at 6000.
+    clock.advanceTo(5_500);
+    release!();
+    await flush();
+    await flush();
+
+    assert.equal(submissions, 1, "no overdue beat is fired immediately after the submit");
+    assert.equal(handle.missedBeats, 5, "each stale cadence slot is counted once");
+    assert.equal(beats.length, 1);
+
+    await clock.tick(); // t=6000
+    assert.equal(submissions, 2, "the next submission lands on the next future slot");
+    assert.equal(beats[1]?.at, 6_000);
+    assert.equal(beats[1]?.lateMs, 0, "the re-anchored cadence is on time");
+
+    await clock.tick(); // t=7000
+    assert.equal(submissions, 3);
+    assert.equal(beats[2]?.at, 7_000);
+    assert.equal(handle.missedBeats, 5, "the recovered cadence adds no further misses");
+
+    await handle.stop();
+  });
+
+  it("preserves the same-second duplicate courtesy across skipped slots", async () => {
+    const clock = fakeClock();
+    let submissions = 0;
+    let release: (() => void) | undefined;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        intervalMs: 400,
+        now: clock.now,
+        wait: clock.wait,
+        submit: async () => {
+          submissions += 1;
+          if (submissions === 1) {
+            await new Promise<void>((resolve) => {
+              release = resolve;
+            });
+          }
+          return {};
+        },
+      }),
+    );
+
+    await clock.tick(); // t=0, still in second 0
+    clock.advanceTo(900); // second 0; all overdue slots remain in the courtesy second
+    release!();
+    await flush();
+    await flush();
+
+    // The scheduler advances past 400 and 800 (both in second 0) and does not
+    // submit another beat in the same second.
+    assert.equal(submissions, 1);
+    assert.equal(handle.missedBeats, 2);
+
+    await clock.tick(); // t=1200, second 1
+    assert.equal(submissions, 2);
+
+    await handle.stop();
   });
 });

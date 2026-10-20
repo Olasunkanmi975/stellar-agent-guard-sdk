@@ -82,6 +82,27 @@ before CI. Representative names (in `tests/unit/`):
 Every mitigation claim above corresponds to a named test; a change that removes
 a fail-closed branch is visible in CI as a dropped test name.
 
+## Diagnostics and redaction
+
+SDK diagnostics are not a safe-to-forward copy of an application request. The
+default logger is silent, and an injected logger receives a copied metadata
+object with sensitive-looking fields removed. The redaction is logger-only: it
+does not mutate errors, adapter callbacks, or telemetry records.
+
+| Surface | May contain application data | Safe default | Redaction point |
+|---|---|---|---|
+| `GuardError` fields | `SimulationError.diagnosticEvents`, `BroadcastError.failure.resultXdr` and diagnostic events, plus the original `cause` | Keep local; forward only the error class, `stage`, `path`, and a reviewed message | Error boundary in the integrator |
+| Adapter `onDecision` / framework requests | Tool names, caller arguments, and framework request objects | Do not serialize the request without an application-specific allowlist | The callback supplied by the integrator |
+| Adapter `onBlocked` | `call`, including Soroban arguments | Forward only `adapter`, `kind`, `reason`, and `explanation` unless the destination is trusted | The `onBlocked` sink |
+| Telemetry with `includeRaw: false` (default) | Decoded event data only | Suitable for normal event handling, subject to the contract data policy | `diagnosticsToEvents` / listener decode |
+| Telemetry with `includeRaw: true` | RPC/XDR source payloads, including raw diagnostic event data | Debugging only; keep short-lived and redact before incident sharing | The consumer's telemetry export |
+| Injected logger metadata | SDK status fields and counters | Safe by default; private/secret/signer/signature/raw/diagnostic/payload/argument fields are omitted | `resolveLogger` / `redactLogMeta` |
+
+The SDK never logs private keys or signer output. It also does not place caller
+arguments or raw RPC payloads in its own logger metadata. The logger test pins
+both field removal and non-mutation; `includeRaw` tests pin that an explicitly
+requested public payload remains available to its caller.
+
 ---
 
 ## README link

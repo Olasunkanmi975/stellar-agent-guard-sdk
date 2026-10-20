@@ -235,6 +235,30 @@ describe("resolveLogger", () => {
     assert.deepEqual(seen, [{ message: "agent-7: retrying", meta: { attempt: 1 } }]);
   });
 
+  it("redacts private keys, signer output, caller arguments, and raw payloads from metadata", () => {
+    const seen: GuardLogMeta[] = [];
+    const original: GuardLogMeta = {
+      safe: "kept",
+      privateKey: "private-key",
+      signerOutput: "signature",
+      rawPayload: { xdr: "payload" },
+      call: { contract: GUARD, fn: "transfer", args: ["caller-data"] },
+      nested: { visible: true, diagnosticEvents: [{ secret: "event" }] },
+    };
+    const logger = resolveLogger({ debug: (_message, meta) => meta && seen.push(meta) });
+
+    logger.debug("diagnostics", original);
+
+    assert.deepEqual(seen, [
+      {
+        safe: "kept",
+        call: { contract: GUARD, fn: "transfer" },
+        nested: { visible: true },
+      },
+    ]);
+    assert.equal(original.privateKey, "private-key", "redaction must not mutate caller metadata");
+  });
+
   it("drops levels the host did not implement instead of routing them elsewhere", () => {
     const seen: string[] = [];
     const logger = resolveLogger({ warn: (message) => seen.push(message) });

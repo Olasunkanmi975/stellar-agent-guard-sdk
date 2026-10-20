@@ -34,7 +34,7 @@ describe("runnable framework adapter examples", () => {
     assert.equal(res.blockedInfos[0]!.adapter, "langchain");
     assert.equal(res.blockedInfos[0]!.kind, "blocked");
     assert.equal(res.blockedInfos[0]!.reason, "recipient_not_allowed");
-    assert.equal(res.blockedInfos[0]!.call.fn, "transfer");
+    assert.equal(res.blockedInfos[0]!.call?.fn, "transfer");
     assert.match(res.blockedInfos[0]!.explanation, /recipient/i);
   });
 
@@ -57,7 +57,7 @@ describe("runnable framework adapter examples", () => {
       assert.equal(res.blockedDecisions[0]!.reason, "per_tx_cap_exceeded");
       assert.match(res.blockedDecisions[0]!.explanation, /exceeds the policy's per-transaction cap/);
     }
-    assert.equal(res.blockedDecisions[0]!.call.fn, "transfer");
+    assert.equal(res.blockedDecisions[0]!.call?.fn, "transfer");
   });
 
   it("executes the MCP adapter example at both boundaries", async () => {
