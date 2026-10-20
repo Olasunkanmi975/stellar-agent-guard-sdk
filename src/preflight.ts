@@ -975,20 +975,11 @@ export class PreFlightInterceptor {
       );
     };
 
-      // Cap the per-call bound by what is left of the batch budget. A caller's
-      // `timeoutMs: 0` opts out of the per-call default, never the batch budget.
-      const remaining = remainingMs();
-      const perCall = options?.timeoutMs;
-      let timeoutMs = perCall;
-      if (remaining !== undefined) {
-        const bound = perCall === undefined ? DEFAULT_RPC_TIMEOUT_MS : perCall;
-        timeoutMs = bound <= 0 ? remaining : Math.min(bound, remaining);
-      }
-
+    for (const call of calls) {
       const checkOptions: PreFlightCheckOptions = {
         ...(options?.onStep ? { onStep: options.onStep } : {}),
         ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
       };
 
       const decision = await this.check(call, checkOptions);
@@ -1057,14 +1048,6 @@ export class PreFlightInterceptor {
         totalEstimatedResourceFee += decision.estimatedResourceFee;
       } else {
         verdicts.push(decision);
-      }
-
-      // The signal can fire or the budget can run out while a call is in
-      // flight. Do not schedule another check after that.
-      const afterCall = stopError();
-      if (afterCall) {
-        fillUnfinished(afterCall);
-        break;
       }
     }
 

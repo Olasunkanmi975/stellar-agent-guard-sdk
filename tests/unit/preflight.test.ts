@@ -12,11 +12,9 @@ import {
   PreFlightUndeterminedError,
   validateContractCall,
   type PreFlightCacheOptions,
-  type PreFlightCheckOptions,
   type PreFlightDecision,
 } from "../../src/preflight.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
-import { FakeClock } from "../../src/clock.ts";
 import { GuardBlockedError } from "../../src/reasons.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
 import type { ContractCall } from "../../src/tx.ts";
