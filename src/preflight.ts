@@ -27,7 +27,13 @@
 import { Keypair, StrKey, rpc, xdr } from "@stellar/stellar-sdk";
 import { concatBytes, sha256Hex, utf8Bytes } from "./hash.ts";
 import { GuardError, SimulationError } from "./errors.ts";
-import { enforceCall, RpcTimeoutError, timeoutOutcome, withRpcAbort } from "./invoke.ts";
+import {
+  DEFAULT_RPC_TIMEOUT_MS,
+  enforceCall,
+  RpcTimeoutError,
+  timeoutOutcome,
+  withRpcAbort,
+} from "./invoke.ts";
 import { resourceBreakdownFromSimulation, type ResourceBreakdown } from "./cost.ts";
 import {
   extractTransferAmount,
@@ -237,11 +243,30 @@ export interface CheckBatchOptions {
    */
   onStep?: (step: InvokeStepEvent) => void;
 
-  /** Caller-owned cancellation, forwarded to every call's `check()`. */
+  /**
+   * Caller-owned cancellation for the whole batch. Once it fires, no further
+   * call is started; every unfinished call is reported as a fail-closed
+   * `undetermined` verdict carrying a typed `RpcTimeoutError`.
+   */
   signal?: AbortSignal | undefined;
 
-  /** Per-RPC timeout, forwarded to every call's `check()`. */
+  /**
+   * Per-call timeout, forwarded to each `check()`. Independent of
+   * `deadlineMs`: a fired per-call timeout leaves the rest of the batch free to
+   * continue, while a spent batch deadline stops it.
+   */
   timeoutMs?: number | undefined;
+
+  /**
+   * Overall time budget for the whole batch, in milliseconds, measured from
+   * the start of `checkBatch()` on the interceptor's injected clock.
+   *
+   * Once spent, no further call is started and the remaining verdicts are
+   * fail-closed `undetermined` results carrying an `RpcTimeoutError` with
+   * `deadline: true`. The budget also caps each individual check's timeout, so
+   * a single long RPC cannot overrun it. Omit for the per-call default.
+   */
+  deadlineMs?: number | undefined;
 }
 
 export interface PreFlightBatchDecision {
@@ -355,8 +380,21 @@ export interface PreFlightConfig {
    */
   logger?: GuardLoggerInput | undefined;
   /**
-   * Inject a custom clock for time-dependent operations (cache TTL, etc.).
-   * Defaults to the system clock; use a FakeClock in tests for deterministic timing.
+   * Coalesce concurrent checks for the same call and config into one
+   * discovery/enforcement run. Defaults to `true`; set `false` to force every
+   * call to run its own simulation.
+   *
+   * Coalescing is per interceptor, so the call fingerprint plus this instance's
+   * config identity is the whole key. Each waiter still applies its own
+   * `signal`/`timeoutMs`, and a settled run — including an undetermined one — is
+   * removed immediately rather than retained as a cache. Checks that supply
+   * `onStep` are never coalesced, so each caller receives its own trace.
+   */
+  coalesceInFlight?: boolean;
+  /**
+   * Inject a custom clock for time-dependent operations (cache TTL, batch
+   * deadlines, etc.). Defaults to the system clock; use a FakeClock in tests
+   * for deterministic timing.
    */
   clock?: Clock;
 }
@@ -377,6 +415,17 @@ interface CacheContext {
   key: string;
   ledger: number;
   expiresAt: number;
+}
+
+/** The fail-closed verdict for a caller bound that fired. */
+function timeoutDecision(error: RpcTimeoutError): PreFlightDecision {
+  const outcome = timeoutOutcome(error);
+  return {
+    allowed: false,
+    kind: "undetermined",
+    detail: outcome.detail,
+    error: outcome.error,
+  };
 }
 
 function policyRevisionToken(revision: PolicyRevision): string {
@@ -416,7 +465,9 @@ export class PreFlightInterceptor {
   private readonly config: PreFlightConfig;
   private readonly cacheOptions: PreFlightCacheOptions | undefined;
   private readonly cache = new Map<string, CacheEntry>();
+  private readonly inFlight = new Map<string, Promise<PreFlightDecision>>();
   private readonly namespace: string;
+  private readonly coalesceInFlight: boolean;
   private readonly logger: GuardLogger;
   private readonly clock: Clock;
 
@@ -424,6 +475,7 @@ export class PreFlightInterceptor {
     this.config = config;
     this.cacheOptions = config.cache;
     this.clock = config.clock ?? systemClock;
+    this.coalesceInFlight = config.coalesceInFlight !== false;
     this.validateCacheOptions();
     this.namespace = this.cacheOptions ? configFingerprint(config) : "";
     this.logger = resolveLogger(config.logger);
@@ -513,9 +565,21 @@ export class PreFlightInterceptor {
    * Accepts per-call `options` (e.g. `onStep` observability) without any
    * effect on the verdict itself; existing single-argument callers are
    * unaffected.
+   *
+   * Concurrent checks for the same call and config share a single in-flight
+   * discovery/enforcement run by default. The shared run is not bound by any
+   * one caller's signal or timeout — one caller giving up must not cancel a
+   * result another waiter is still entitled to — so each caller races the same
+   * work against its own bound instead.
    */
   async check(call: ContractCall, options?: PreFlightCheckOptions): Promise<PreFlightDecision> {
     validateContractCall(call);
+
+    // An already-aborted caller asks for no work at all, including the cache
+    // lookup's ledger read. Answer before any RPC or in-flight registration.
+    if (options?.signal?.aborted) {
+      return timeoutDecision(new RpcTimeoutError({ stage: "pre-flight", aborted: true }));
+    }
 
     const context = await this.cacheContext(call);
     if (context) {
@@ -538,6 +602,63 @@ export class PreFlightInterceptor {
         this.cache.delete(context.key);
       }
     }
+
+    // An `onStep` observer owns its enforcement trace, so a check that supplies
+    // one is not coalesced: sharing a run would either drop that observer's
+    // events or interleave two observers over one pipeline.
+    if (options?.onStep || !this.coalesceInFlight) {
+      return this.computeDecision(call, context, options?.onStep, {
+        signal: options?.signal,
+        timeoutMs: options?.timeoutMs,
+      });
+    }
+
+    // The map is per interceptor, so the call fingerprint plus this instance's
+    // config identity is the whole in-flight key.
+    const key = context ? context.key : callFingerprint(call);
+    let shared = this.inFlight.get(key);
+    if (!shared) {
+      // The shared run keeps the pipeline's default bound so a hung RPC cannot
+      // pin the entry forever; callers that asked for a tighter bound race it
+      // below, and never shorten it for anyone else.
+      shared = this.computeDecision(call, context, undefined, {
+        timeoutMs: DEFAULT_RPC_TIMEOUT_MS,
+      });
+      this.inFlight.set(key, shared);
+      const settle = () => {
+        if (this.inFlight.get(key) === shared) this.inFlight.delete(key);
+      };
+      // Remove on both success and failure. Coalescing is not a cache: no
+      // outcome — admitted, refused or undetermined — survives the run.
+      shared.then(settle, settle);
+    }
+    return this.awaitWithCallerBound(shared, options);
+  }
+
+  /** Race coalesced work against the waiting caller's own signal/timeout. */
+  private async awaitWithCallerBound(
+    work: Promise<PreFlightDecision>,
+    options?: PreFlightCheckOptions,
+  ): Promise<PreFlightDecision> {
+    const { signal, timeoutMs } = options ?? {};
+    if (!signal && timeoutMs === undefined) return work;
+    try {
+      return await withRpcAbort(
+        { stage: "pre-flight", signal, timeoutMs: timeoutMs ?? 0 },
+        () => work,
+      );
+    } catch (error) {
+      if (!(error instanceof RpcTimeoutError)) throw error;
+      return timeoutDecision(error);
+    }
+  }
+
+  private async computeDecision(
+    call: ContractCall,
+    context: CacheContext | null,
+    onStep: ((step: InvokeStepEvent) => void) | undefined,
+    bound: { signal?: AbortSignal | undefined; timeoutMs?: number | undefined },
+  ): Promise<PreFlightDecision> {
     // A bound that fired is a verdict, not a crash: the guard never reached a
     // decision, so the check returns its fail-closed `undetermined` arm (the
     // same arm any other unrunnable simulation takes) carrying the typed
@@ -548,8 +669,8 @@ export class PreFlightInterceptor {
       outcome = await withRpcAbort(
         {
           stage: "pre-flight",
-          signal: options?.signal,
-          timeoutMs: options?.timeoutMs,
+          signal: bound.signal,
+          timeoutMs: bound.timeoutMs,
         },
         () =>
           enforceCall({
@@ -559,7 +680,7 @@ export class PreFlightInterceptor {
             networkPassphrase: this.config.networkPassphrase,
             guardAuth: { guard: this.config.guard, agent: this.config.agent },
             ...(this.config.accountSigners ? { accountSigners: this.config.accountSigners } : {}),
-            ...(options?.onStep ? { onStep: options.onStep } : {}),
+            ...(onStep ? { onStep } : {}),
             ...(this.config.logger ? { logger: this.config.logger } : {}),
           }),
       );
@@ -697,6 +818,18 @@ export class PreFlightInterceptor {
     calls: ContractCall[],
     options?: CheckBatchOptions,
   ): Promise<PreFlightBatchDecision> {
+    if (options?.deadlineMs !== undefined) {
+      if (
+        typeof options.deadlineMs !== "number" ||
+        !Number.isFinite(options.deadlineMs) ||
+        options.deadlineMs <= 0
+      ) {
+        throw new RangeError(
+          "checkBatch deadlineMs must be a positive finite number of milliseconds",
+        );
+      }
+    }
+
     if (calls.length === 0) {
       return {
         admissible: true,
@@ -707,36 +840,121 @@ export class PreFlightInterceptor {
       };
     }
 
-    // Resolve policy and initial window spend for staging
-    let policy: ReadonlyPolicyConfig | null = options?.policy ?? this.config.policy ?? null;
-    let initialWindowSpent: bigint = options?.initialWindowSpent ?? 0n;
+    const deadlineAt =
+      options?.deadlineMs === undefined ? undefined : this.clock.now() + options.deadlineMs;
 
-    if (policy === null || options?.initialWindowSpent === undefined) {
-      try {
-        const fetched = await fetchGuardPolicyAndWindow(this.config.server, this.config.guard);
-        if (policy === null) {
-          policy = fetched.policy;
-        }
-        if (options?.initialWindowSpent === undefined) {
-          initialWindowSpent = fetched.windowSpent;
-        }
-      } catch {
-        // Fall back gracefully if ledger entry fetch is not possible (e.g. mock server in unit tests)
+    const remainingMs = (): number | undefined =>
+      deadlineAt === undefined ? undefined : deadlineAt - this.clock.now();
+
+    /**
+     * The typed reason the batch must stop starting new work, if any. A caller
+     * abort wins over the deadline so the verdict says what actually happened.
+     */
+    const stopError = (): RpcTimeoutError | null => {
+      if (options?.signal?.aborted) {
+        return new RpcTimeoutError({ stage: "pre-flight", aborted: true });
       }
-    }
+      if (deadlineAt !== undefined && this.clock.now() >= deadlineAt) {
+        return new RpcTimeoutError({
+          stage: "pre-flight",
+          aborted: false,
+          deadline: true,
+          ...(options?.deadlineMs === undefined ? {} : { timeoutMs: options.deadlineMs }),
+        });
+      }
+      return null;
+    };
 
     let stagedWindowSpent = 0n;
     let allAdmissible = true;
     let totalEstimatedResourceFee = 0n;
     const verdicts: PreFlightDecision[] = [];
 
-    const checkOptions: PreFlightCheckOptions = {
-      ...(options?.onStep ? { onStep: options.onStep } : {}),
-      ...(options?.signal !== undefined ? { signal: options.signal } : {}),
-      ...(options?.timeoutMs !== undefined ? { timeoutMs: options.timeoutMs } : {}),
+    const finish = (): PreFlightBatchDecision => ({
+      admissible: allAdmissible,
+      overallAdmissible: allAdmissible,
+      verdicts,
+      calls: verdicts,
+      totalEstimatedResourceFee,
+    });
+
+    /** Fail closed every call that was never allowed to start. */
+    const fillUnfinished = (error: RpcTimeoutError): void => {
+      const verdict = timeoutDecision(error);
+      while (verdicts.length < calls.length) verdicts.push(verdict);
+      allAdmissible = false;
     };
 
+    // An already-cancelled batch performs no policy read and no simulation:
+    // every call gets the same fail-closed verdict.
+    const initialStop = stopError();
+    if (initialStop) {
+      fillUnfinished(initialStop);
+      return finish();
+    }
+
+    // Resolve policy and initial window spend for staging. The read is part of
+    // the batch, so it is bound by the same signal/deadline budget.
+    let policy: ReadonlyPolicyConfig | null = options?.policy ?? this.config.policy ?? null;
+    let initialWindowSpent: bigint = options?.initialWindowSpent ?? 0n;
+
+    if (policy === null || options?.initialWindowSpent === undefined) {
+      try {
+        const remaining = remainingMs();
+        const fetch = () => fetchGuardPolicyAndWindow(this.config.server, this.config.guard);
+        const fetched =
+          options?.signal !== undefined || remaining !== undefined
+            ? await withRpcAbort(
+                {
+                  stage: "pre-flight",
+                  signal: options?.signal,
+                  timeoutMs: remaining ?? 0,
+                },
+                fetch,
+              )
+            : await fetch();
+        if (policy === null) {
+          policy = fetched.policy;
+        }
+        if (options?.initialWindowSpent === undefined) {
+          initialWindowSpent = fetched.windowSpent;
+        }
+      } catch (error) {
+        // A cancellation or spent deadline is not "no policy": stop before any
+        // call and report the unfinished work as undetermined.
+        if (error instanceof RpcTimeoutError) {
+          fillUnfinished(error);
+          return finish();
+        }
+        // Fall back gracefully if ledger entry fetch is not possible (e.g. mock server in unit tests)
+      }
+    }
+
     for (const call of calls) {
+      // Stop before the next RPC once the caller's signal fires or the batch
+      // budget is spent; the remaining calls are answered without any work.
+      const beforeCall = stopError();
+      if (beforeCall) {
+        fillUnfinished(beforeCall);
+        break;
+      }
+
+      // Cap the per-call bound by what is left of the batch budget. A caller's
+      // `timeoutMs: 0` opts out of the per-call default, never the batch budget.
+      const remaining = remainingMs();
+      const perCall = options?.timeoutMs;
+      let timeoutMs = perCall;
+      if (remaining !== undefined) {
+        const bound = perCall === undefined ? DEFAULT_RPC_TIMEOUT_MS : perCall;
+        timeoutMs = bound <= 0 ? remaining : Math.min(bound, remaining);
+      }
+
+      const checkOptions: PreFlightCheckOptions = {
+        ...(options?.onStep ? { onStep: options.onStep } : {}),
+        ...(options?.signal !== undefined ? { signal: options.signal } : {}),
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+      };
+
       const decision = await this.check(call, checkOptions);
 
       if (decision.kind === "admissible") {
@@ -757,6 +975,11 @@ export class PreFlightInterceptor {
             };
             verdicts.push(blockedDecision);
             allAdmissible = false;
+            const afterCall = stopError();
+            if (afterCall) {
+              fillUnfinished(afterCall);
+              break;
+            }
             continue;
           }
           stagedWindowSpent += amount;
@@ -768,15 +991,17 @@ export class PreFlightInterceptor {
         verdicts.push(decision);
         allAdmissible = false;
       }
+
+      // The signal can fire or the budget can run out while a call is in
+      // flight. Do not schedule another check after that.
+      const afterCall = stopError();
+      if (afterCall) {
+        fillUnfinished(afterCall);
+        break;
+      }
     }
 
-    return {
-      admissible: allAdmissible,
-      overallAdmissible: allAdmissible,
-      verdicts,
-      calls: verdicts,
-      totalEstimatedResourceFee,
-    };
+    return finish();
   }
 
   /**

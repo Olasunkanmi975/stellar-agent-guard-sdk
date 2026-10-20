@@ -12,9 +12,11 @@ import {
   PreFlightUndeterminedError,
   validateContractCall,
   type PreFlightCacheOptions,
+  type PreFlightCheckOptions,
   type PreFlightDecision,
 } from "../../src/preflight.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
+import { FakeClock } from "../../src/clock.ts";
 import { GuardBlockedError } from "../../src/reasons.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
 import type { ContractCall } from "../../src/tx.ts";
@@ -823,6 +825,173 @@ describe("PreFlightInterceptor simulation cache", () => {
 /* -------------------------------------------------------------------------- */
 
 /**
+ * In-flight coalescing: concurrent checks for the same call share one
+ * discovery/enforcement run, without turning into a durable cache and without
+ * letting one caller's bound cancel another caller's result.
+ */
+describe("PreFlightInterceptor in-flight coalescing", () => {
+  function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function admissibleSimulation() {
+    return {
+      result: { auth: [] },
+      minResourceFee: "17",
+      transactionData: { getReadOnly: () => [], getReadWrite: () => [{}] },
+    };
+  }
+
+  function makeHarness(options: { rejected?: boolean } = {}) {
+    const source = Keypair.random();
+    const gate = deferred();
+    const probeStarted = deferred();
+    let simulations = 0;
+    const server = {
+      getAccount: async () => new Account(source.publicKey(), "1"),
+      getLatestLedger: async () => ({ sequence: 100 }),
+      simulateTransaction: async () => {
+        simulations += 1;
+        if (simulations === 1) probeStarted.resolve();
+        await gate.promise;
+        return options.rejected ? { error: "HostError: trap" } : admissibleSimulation();
+      },
+    } as unknown as rpc.Server;
+    return {
+      server,
+      source,
+      probeStarted: probeStarted.promise,
+      release: () => gate.resolve(),
+      get simulations() {
+        return simulations;
+      },
+    };
+  }
+
+  function makeInterceptor(harness: ReturnType<typeof makeHarness>) {
+    return new PreFlightInterceptor({
+      server: harness.server,
+      networkPassphrase: NETWORK_PASSPHRASE,
+      guard: VALID_GUARD,
+      agent: harness.source,
+      source: harness.source,
+    });
+  }
+
+  it("runs one discovery/enforcement pass for concurrent identical calls", async () => {
+    const harness = makeHarness();
+    const interceptor = makeInterceptor(harness);
+    const call = validTransferCall(10n);
+
+    const first = interceptor.check(call);
+    const second = interceptor.check(call);
+    await harness.probeStarted;
+    harness.release();
+
+    const [firstDecision, secondDecision] = await Promise.all([first, second]);
+    assert.equal(firstDecision.kind, "admissible");
+    assert.equal(secondDecision.kind, "admissible");
+    // One probe plus one enforced simulation, not two of each.
+    assert.equal(harness.simulations, 2);
+    assert.equal(secondDecision, firstDecision);
+
+    // The settled entry is gone: the next call runs its own pass.
+    await new Promise((resolve) => setImmediate(resolve));
+    const later = await interceptor.check(call);
+    assert.equal(later.kind, "admissible");
+    assert.equal(harness.simulations, 4);
+  });
+
+  it("can be disabled per interceptor", async () => {
+    const harness = makeHarness();
+    const interceptor = new PreFlightInterceptor({
+      server: harness.server,
+      networkPassphrase: NETWORK_PASSPHRASE,
+      guard: VALID_GUARD,
+      agent: harness.source,
+      source: harness.source,
+      coalesceInFlight: false,
+    });
+    const call = validTransferCall(10n);
+
+    const first = interceptor.check(call);
+    const second = interceptor.check(call);
+    harness.release();
+
+    const [firstDecision, secondDecision] = await Promise.all([first, second]);
+    assert.equal(firstDecision.kind, "admissible");
+    assert.equal(secondDecision.kind, "admissible");
+    assert.equal(harness.simulations, 4);
+  });
+
+  it("does not coalesce distinct calls", async () => {
+    const harness = makeHarness();
+    const interceptor = makeInterceptor(harness);
+
+    const first = interceptor.check(validTransferCall(10n));
+    const second = interceptor.check(validTransferCall(20n));
+    harness.release();
+
+    const [firstDecision, secondDecision] = await Promise.all([first, second]);
+    assert.equal(firstDecision.kind, "admissible");
+    assert.equal(secondDecision.kind, "admissible");
+    assert.equal(harness.simulations, 4);
+  });
+
+  it("keeps a waiter's result when another waiter's signal aborts", async () => {
+    const harness = makeHarness();
+    const interceptor = makeInterceptor(harness);
+    const call = validTransferCall(10n);
+    const controller = new AbortController();
+
+    const aborted = interceptor.check(call, { signal: controller.signal });
+    const patient = interceptor.check(call);
+    await harness.probeStarted;
+
+    controller.abort();
+    harness.release();
+
+    const [abortedDecision, patientDecision] = await Promise.all([aborted, patient]);
+    assert.equal(abortedDecision.kind, "undetermined");
+    assert.ok(abortedDecision.error instanceof RpcTimeoutError);
+    assert.equal(abortedDecision.error.aborted, true);
+    // The abort cancelled one waiter's wait, not the shared run.
+    assert.equal(patientDecision.kind, "admissible");
+    assert.equal(harness.simulations, 2);
+  });
+
+  it("removes a rejected run and never persists its undetermined outcome", async () => {
+    const harness = makeHarness({ rejected: true });
+    const interceptor = makeInterceptor(harness);
+    const call = validTransferCall(10n);
+
+    const first = interceptor.check(call);
+    const second = interceptor.check(call);
+    await harness.probeStarted;
+    harness.release();
+
+    const [firstDecision, secondDecision] = await Promise.all([first, second]);
+    assert.equal(firstDecision.kind, "undetermined");
+    assert.equal(secondDecision.kind, "undetermined");
+    assert.equal(harness.simulations, 1);
+
+    // A settled failure is removed, not cached: the next call runs again.
+    await new Promise((resolve) => setImmediate(resolve));
+    const third = await interceptor.check(call);
+    assert.equal(third.kind, "undetermined");
+    assert.equal(harness.simulations, 2);
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+/**
  * Batched pre-flight: the all-or-nothing aggregate over a list of calls.
  *
  * The single-call path is mocked RPC; what these tests pin is the *staging* on
@@ -1125,5 +1294,132 @@ describe("PreFlightInterceptor.checkBatch()", () => {
         return true;
       },
     );
+  });
+
+  it("does no work at all when the batch signal is already aborted", async () => {
+    const harness = batchServer({ enforcedRuns: [] });
+    const interceptor = batchInterceptor(harness.server, policyWithWindowCap(1_000n));
+    const controller = new AbortController();
+    controller.abort();
+
+    const decision = await interceptor.checkBatch(
+      [transferCall(10n), transferCall(20n)],
+      { initialWindowSpent: 0n, signal: controller.signal },
+    );
+
+    assert.equal(decision.admissible, false);
+    assert.equal(decision.verdicts.length, 2);
+    for (const verdict of decision.verdicts) {
+      assert.equal(verdict.kind, "undetermined");
+      assert.ok(verdict.error instanceof RpcTimeoutError);
+      assert.equal(verdict.error.aborted, true);
+    }
+    assert.equal(harness.simulations, 0, "an already-aborted batch must issue no RPC");
+  });
+
+  it("stops before the next call after a mid-batch abort", async () => {
+    /** Abort after the first completed check, so the boundary is deterministic. */
+    class AbortAfterFirstCheck extends PreFlightInterceptor {
+      readonly controller = new AbortController();
+      private completedChecks = 0;
+
+      override async check(
+        call: ContractCall,
+        options?: PreFlightCheckOptions,
+      ): Promise<PreFlightDecision> {
+        const decision = await super.check(call, options);
+        this.completedChecks += 1;
+        if (this.completedChecks === 1) this.controller.abort();
+        return decision;
+      }
+    }
+
+    const harness = batchServer({
+      enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
+    });
+    const interceptor = new AbortAfterFirstCheck({
+      server: harness.server,
+      networkPassphrase: PASSPHRASE,
+      guard: CONTRACT,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+      policy: policyWithWindowCap(1_000n),
+    });
+
+    const decision = await interceptor.checkBatch(
+      [transferCall(10n), transferCall(20n), transferCall(30n)],
+      { initialWindowSpent: 0n, signal: interceptor.controller.signal },
+    );
+
+    assert.equal(decision.admissible, false);
+    assert.deepEqual(
+      decision.verdicts.map((verdict) => verdict.kind),
+      ["admissible", "undetermined", "undetermined"],
+    );
+    assert.equal(decision.totalEstimatedResourceFee, 10n);
+    // The first call's probe + enforced run only; the other two never started.
+    assert.equal(harness.simulations, 2);
+    const unfinished = decision.verdicts[1];
+    assert.ok(unfinished?.kind === "undetermined");
+    assert.ok(unfinished.error instanceof RpcTimeoutError);
+    assert.equal(unfinished.error.aborted, true);
+  });
+
+  it("spends one deadline budget across the batch without wall-clock sleeps", async () => {
+    const clock = new FakeClock(1_000);
+    const harness = batchServer({
+      enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
+    });
+    const interceptor = new PreFlightInterceptor({
+      server: harness.server,
+      networkPassphrase: PASSPHRASE,
+      guard: CONTRACT,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+      policy: policyWithWindowCap(1_000n),
+      clock,
+    });
+    let advanced = false;
+
+    const decision = await interceptor.checkBatch(
+      [transferCall(10n), transferCall(20n)],
+      {
+        initialWindowSpent: 0n,
+        deadlineMs: 5_000,
+        onStep: (step) => {
+          // Advance virtual time while the first call is running. The first
+          // call was already admitted its bound; the loop must not start the
+          // second one once the budget is gone.
+          if (!advanced && step.name === "probe" && step.status === "start") {
+            advanced = true;
+            clock.advance(5_001);
+          }
+        },
+      },
+    );
+
+    assert.equal(decision.admissible, false);
+    assert.equal(decision.verdicts[0]?.kind, "admissible");
+    const unfinished = decision.verdicts[1];
+    assert.ok(unfinished?.kind === "undetermined");
+    assert.ok(unfinished.error instanceof RpcTimeoutError);
+    assert.equal(unfinished.error.deadline, true);
+    assert.equal(unfinished.error.timeoutMs, 5_000);
+    assert.equal(harness.simulations, 2);
+  });
+
+  it("rejects a non-positive batch deadline before any work", async () => {
+    const harness = batchServer({ enforcedRuns: [] });
+    const interceptor = batchInterceptor(harness.server, policyWithWindowCap(1_000n));
+
+    await assert.rejects(
+      interceptor.checkBatch([transferCall(10n)], { deadlineMs: 0 }),
+      (error: unknown) => {
+        assert.ok(error instanceof RangeError);
+        assert.match(error.message, /deadlineMs/);
+        return true;
+      },
+    );
+    assert.equal(harness.simulations, 0);
   });
 });

@@ -512,21 +512,34 @@ read `signal` as *stop soon and stop asking*, not *cancel the socket*.
 
 ### Bounding a check or an invoke (`signal` and `timeoutMs`)
 
-`check()`, `CostPreChecker.check()` and `invoke()` each accept two optional
-caller-owned bounds on the RPC calls they make:
+`check()`, `checkBatch()`, `CostPreChecker.check()` and `invoke()` each accept
+two optional caller-owned bounds on the RPC calls they make:
 
 - `signal?: AbortSignal` — your runtime's cancellation (a tool-loop deadline, a
   shutdown hook, a user's "stop"). An **already-aborted** signal returns before
-  any RPC call is issued.
+  any RPC call is issued. On a batch it stops the batch: no further call is
+  started, and every unfinished call is reported as fail-closed `undetermined`.
 - `timeoutMs?: number` — a per-RPC-call budget in milliseconds. It defaults to
   `DEFAULT_RPC_TIMEOUT_MS` (**30s**), because a network partition that leaves a
   guardrail call pending forever is a hang, not a fail-closed decision. Pass
   `timeoutMs: 0` to opt out and rely on `signal` alone.
-- `deadlineMs?: number` — **`invoke()` only**: one overall budget for the whole
-  action (discovery, signing, retries, broadcast and polling). Expiry is
-  fail-closed and reported as an `RpcTimeoutError` with `deadline: true`; it can
-  never become an `allowed` outcome. Pass `clock` to make the accounting
+- `deadlineMs?: number` — **`invoke()` and `checkBatch()`**: one overall budget
+  for the whole action (for a batch: policy read plus every staged call). Expiry
+  is fail-closed and reported as an `RpcTimeoutError` with `deadline: true`; it
+  can never become an `allowed` outcome. On a batch, calls that never started are
+  `undetermined` rather than skipped. Pass `clock` to make the accounting
   deterministic in tests. See `docs/api/invoke-pipeline.md`.
+
+**Concurrent identical checks are coalesced.** `PreFlightInterceptor` shares one
+in-flight discovery/enforcement run when the same call and config are checked at
+the same time, so an agent framework issuing duplicate tool checks in one
+planning turn does not pay for duplicate RPCs. This is not a cache: the entry is
+removed as soon as the run settles, including on failure or `undetermined`. Each
+waiter still applies its own `signal`/`timeoutMs` — one caller giving up never
+cancels a result another waiter is entitled to — while the shared run itself
+keeps the pipeline's default `DEFAULT_RPC_TIMEOUT_MS` bound. Checks that supply
+`onStep` keep their own run so each trace sees every event, and
+`coalesceInFlight: false` disables coalescing entirely.
 
 **The typed error is the same; where it surfaces is deliberately not.** A bound
 that fires raises one class, `RpcTimeoutError` (carrying `stage` and whether it
@@ -536,6 +549,7 @@ questions:
 | Call | Fired bound |
 | --- | --- |
 | `check()` / `CostPreChecker.check()` | the fail-closed `undetermined` **verdict** (`decision.error instanceof RpcTimeoutError`) — the guard reached no decision, which is what `undetermined` already means |
+| `checkBatch()` | `undetermined` verdicts for the call in flight and for every call that never started; the completed verdicts keep their own kind |
 | `invoke()` | `invoke`'s `error` **outcome** (`outcome.error instanceof RpcTimeoutError`) — the pipeline never reached broadcast |
 
 ```ts
@@ -854,8 +868,9 @@ The combined heartbeat-loop + pre-flight pattern is tracked as an integration gu
 ### Interception & Execution
 
 - `PreFlightInterceptor`
-  - `constructor(options: PreFlightInterceptorOptions)` — Pass `cache: { ttlMs }` or `cache: { ttlLedgers }` to opt into the short-lived cache; omit it for fresh simulations.
+  - `constructor(options: PreFlightInterceptorOptions)` — Pass `cache: { ttlMs }` or `cache: { ttlLedgers }` to opt into the short-lived cache; omit it for fresh simulations. Concurrent identical `check()` calls share one in-flight run by default; pass `coalesceInFlight: false` to disable that.
   - `check(call: ContractCall, options?: PreFlightCheckOptions): Promise<PreFlightDecision>` — Returns `admissible | blocked | undetermined` without throwing or broadcasting. `options.signal` / `options.timeoutMs` bound the RPC calls it makes; a fired bound returns the fail-closed `undetermined` verdict carrying a typed `RpcTimeoutError` — see [Bounding a check or an invoke](#bounding-a-check-or-an-invoke-signal-and-timeoutms).
+  - `checkBatch(calls: ContractCall[], options?: CheckBatchOptions): Promise<PreFlightBatchDecision>` — Returns one verdict per call with all-or-nothing `admissible` semantics. `options.signal` bounds the whole batch, `options.deadlineMs` sets one overall budget, and `options.timeoutMs` stays per-call. A cancelled or over-budget batch stops before the next call and reports every unfinished call as `undetermined`.
   - `assertAllowed(call: ContractCall): Promise<AdmissibleDecision>` — Asserts allowed or throws `GuardBlockedError`.
   - `invalidate(call?: ContractCall): void` — Clears all cached decisions or only entries for one call.
 - `CostPreChecker`
