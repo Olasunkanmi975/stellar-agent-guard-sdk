@@ -9,6 +9,7 @@ import { describe, it } from "node:test";
 import { Keypair } from "@stellar/stellar-sdk";
 import {
   HeartbeatBlockedError,
+  HeartbeatDryRunError,
   HeartbeatIntervalError,
   isRetryableHeartbeatFailure,
   startHeartbeat,
@@ -620,6 +621,14 @@ describe("startHeartbeat bounded retry (issue #340)", () => {
       isRetryableHeartbeatFailure(new HeartbeatBlockedError({ reason: "paused" })),
       false,
     );
+    // A dry run never reached the guard; re-running the same configuration as a
+    // retry cannot change that.
+    assert.equal(
+      isRetryableHeartbeatFailure(
+        new HeartbeatDryRunError({ verdict: "admissible", reason: null, detail: null }),
+      ),
+      false,
+    );
     // Anything unclassifiable is reported, not retried.
     assert.equal(isRetryableHeartbeatFailure(new Error("boom")), false);
     assert.equal(isRetryableHeartbeatFailure("boom"), false);
@@ -958,6 +967,191 @@ describe("startHeartbeat stale cadence slots (issue #339)", () => {
 
     await clock.tick(); // t=1200, second 1
     assert.equal(submissions, 2);
+
+    await handle.stop();
+  });
+});
+
+/**
+ * Outcome classification (issue #292).
+ *
+ * `invoke()` resolves with a refusal (`blocked`), a pipeline failure (`error`)
+ * or a dry run (`dry_run`) just as it resolves with an allowed submission.
+ * Only the allowed arm is a beat: every other resolved outcome must leave
+ * `lastBeatAt` — and the same-second dedupe marker — untouched, report itself
+ * once through `onError` with a type that distinguishes a refusal from an RPC
+ * failure, and leave the next cadence free to try again.
+ */
+describe("startHeartbeat outcome classification (issue #292)", () => {
+  const allowedOutcome: InvokeOutcome = {
+    kind: "allowed",
+    submission: {
+      hash: "a1b2c3",
+      status: "SUCCESS",
+      ledger: 42,
+      failure: null,
+      events: [],
+    },
+  };
+
+  const blockedOutcome: InvokeOutcome = {
+    kind: "blocked",
+    reason: "paused",
+    detail: "the policy is paused",
+    diagnosticEvents: [],
+  };
+
+  const errorOutcome: InvokeOutcome = {
+    kind: "error",
+    detail: "the RPC was unreachable",
+    error: new BroadcastError("rpc down"),
+    diagnosticEvents: [],
+  };
+
+  const dryRunOutcome: InvokeOutcome = {
+    kind: "dry_run",
+    admissible: true,
+    verdict: "admissible",
+    reason: null,
+    detail: null,
+    error: null,
+    fees: { resourceFeeStroops: 1n, inclusionFeeStroops: 2n, totalFeeStroops: 3n },
+    diagnostics: [],
+    steps: [],
+  };
+
+  it("does not count a dry-run outcome as a beat", async () => {
+    const clock = fakeClock();
+    const errors: unknown[] = [];
+    const beats: HeartbeatBeat[] = [];
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        now: clock.now,
+        wait: clock.wait,
+        graceSecs: 30,
+        submit: async () => ({ outcome: dryRunOutcome }),
+        onBeat: (beat) => beats.push(beat),
+        onError: (error) => errors.push(error),
+      }),
+    );
+
+    await clock.tick();
+
+    assert.equal(beats.length, 0, "a dry run never reached the guard, so it is not a beat");
+    assert.equal(handle.lastBeatAt, null, "lastBeatAt must not advance");
+    assert.equal(errors.length, 1, "the resolved non-answer is reported exactly once");
+    assert.ok(errors[0] instanceof HeartbeatDryRunError);
+    assert.equal((errors[0] as HeartbeatDryRunError).verdict, "admissible");
+    assert.equal((errors[0] as HeartbeatDryRunError).reason, null);
+
+    await handle.stop();
+  });
+
+  it("retries every non-allowed outcome on the next cadence", async () => {
+    const clock = fakeClock();
+    const errors: unknown[] = [];
+    const beats: HeartbeatBeat[] = [];
+    const outcomes = [blockedOutcome, errorOutcome, dryRunOutcome, allowedOutcome];
+    let submissions = 0;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        intervalMs: 1_000,
+        now: clock.now,
+        wait: clock.wait,
+        graceSecs: 30,
+        submit: async () => {
+          const outcome = outcomes[submissions] ?? allowedOutcome;
+          submissions += 1;
+          const ledger = outcome.kind === "allowed" ? outcome.submission.ledger : null;
+          return ledger === null ? { outcome } : { outcome, ledger };
+        },
+        onBeat: (beat) => beats.push(beat),
+        onError: (error) => errors.push(error),
+      }),
+    );
+
+    // t=0: refused by the guard. A refusal is terminal for this beat, not for
+    // the scheduler: no beat is counted and the same second is not marked.
+    await clock.tick();
+    assert.equal(submissions, 1);
+    assert.equal(handle.lastBeatAt, null);
+    assert.equal(errors.length, 1);
+    assert.ok(errors[0] instanceof HeartbeatBlockedError);
+
+    // t=1000: the RPC failed. The typed pipeline error is reported as-is, so an
+    // operator can tell it from a refusal.
+    await clock.tick();
+    assert.equal(submissions, 2, "the next cadence tries again after a refusal");
+    assert.equal(handle.lastBeatAt, null);
+    assert.equal(errors.length, 2);
+    assert.ok(errors[1] instanceof BroadcastError);
+
+    // t=2000: the submission ran as a dry run, so nothing was broadcast.
+    await clock.tick();
+    assert.equal(submissions, 3, "the next cadence tries again after an RPC failure");
+    assert.equal(handle.lastBeatAt, null);
+    assert.equal(errors.length, 3);
+    assert.ok(errors[2] instanceof HeartbeatDryRunError);
+
+    // t=3000: the guard accepts the heartbeat. Only now is it a beat.
+    await clock.tick();
+    assert.equal(submissions, 4, "the next cadence tries again after a dry run");
+    assert.equal(errors.length, 3, "a recovered beat reports no further error");
+    assert.equal(beats.length, 1);
+    assert.equal(beats[0]!.at, 3_000);
+    assert.equal(beats[0]!.ledger, 42);
+    assert.equal(handle.lastBeatAt, 3_000, "the allowed outcome advances lastBeatAt once");
+
+    await handle.stop();
+  });
+
+  it("does not let a refused beat claim the same-second courtesy", async () => {
+    const clock = fakeClock();
+    const errors: unknown[] = [];
+    const beats: HeartbeatBeat[] = [];
+    let submissions = 0;
+
+    const handle = await startHeartbeat(
+      baseOptions({
+        intervalMs: 400,
+        now: clock.now,
+        wait: clock.wait,
+        graceSecs: 30,
+        submit: async () => {
+          submissions += 1;
+          if (submissions === 1) return { outcome: blockedOutcome };
+          return { outcome: allowedOutcome, ledger: 42 };
+        },
+        onBeat: (beat) => beats.push(beat),
+        onError: (error) => errors.push(error),
+      }),
+    );
+
+    await clock.tick(); // t=0, second 0: refused
+    assert.equal(submissions, 1);
+    assert.equal(handle.lastBeatAt, null);
+    assert.equal(errors.length, 1);
+
+    // t=400, still second 0. If the refusal had advanced `lastBeatSecond`, this
+    // cadence would be suppressed as a duplicate; it must be submitted.
+    await clock.tick();
+    assert.equal(submissions, 2, "a refused beat must not suppress the next cadence");
+    assert.equal(handle.lastBeatAt, 400);
+    assert.equal(beats.length, 1, "the accepted result is counted once");
+    assert.equal(errors.length, 1, "a successful result reports no error");
+
+    // The accepted beat at t=400 now owns second 0, so t=800 is the courtesy
+    // skip. A successful result updates the dedupe marker exactly once.
+    await clock.tick();
+    assert.equal(submissions, 2, "an accepted beat suppresses a same-second duplicate");
+
+    // t=1200 is a new second: the scheduler beats again, once.
+    await clock.tick();
+    assert.equal(submissions, 3);
+    assert.equal(beats.length, 2);
+    assert.equal(handle.lastBeatAt, 1_200);
 
     await handle.stop();
   });

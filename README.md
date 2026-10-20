@@ -776,8 +776,11 @@ network ID, invocation, nonce, expiration ledger, or transaction freshness.
 
 ### Typed errors and 0.1.x migration
 
-All SDK-owned errors now share a `GuardError` base. `invoke()` remains result-oriented:
-inspect `outcome.error` with `instanceof` when `outcome.kind === "error"`.
+All operational SDK errors share a `GuardError` base. Invalid caller input is the
+deliberate exception: `InvalidInputError` (and `InvalidFeeCeilingError`) extend
+`TypeError`, keeping programmer errors distinct from transport, signing and policy
+failures. `invoke()` remains result-oriented: inspect `outcome.error` with `instanceof`
+when `outcome.kind === "error"`.
 
 ```ts
 import {

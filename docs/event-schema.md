@@ -499,7 +499,7 @@ so it must be converted with `StrKey.encodeContract`.
 
 | Struct                 | Emitted topic[0]       | Data            |
 | ---------------------- | ---------------------- | --------------- |
-| `EventAuthChecked`     | `event_auth_checked`   | none (`{}`)     |
+| `EventAuthChecked`     | `event_auth_checked`   | `{ contract: Option<Address>, fn_name: Option<Symbol>, context_index: u32, revision: u64 }` |
 | `EventHeartbeat`       | `event_heartbeat`      | `{ at: u64 }`   |
 | `EventInitialized`     | `event_initialized`    | `{ by: Address }` |
 | `EventFrozen`          | `event_frozen`         | `{ by: Address }` |
@@ -511,6 +511,20 @@ The decision event's layout is `[event_auth_checked, <allowed|blocked>, <reason>
 (`result` and `reason` are the struct's `#[topic]` fields). The reason vocabulary
 is the same set of symbols `src/reasons.ts` mirrors from the contract's `Error`
 enum.
+
+Both the topic layout and the data payload are defined by the contracts repo's
+own vocabulary fixture,
+`stellar-agent-guard-contracts/tests/fixtures/auth-checked-vocabulary.json`
+(contracts issue #42), which this SDK vendors at
+`tests/fixtures/vendor/auth-checked-vocabulary.json` and asserts against in
+`tests/unit/auth-checked-vocabulary.test.ts` — so the matrix is read from one
+place rather than copied into this repository, and an outcome the contract adds
+fails a test until the SDK's decoder knows about it.
+
+The Phase 2 instance recorded in `tests/fixtures/integration-evidence.md`
+predates that data payload and emits `{}` for the decision event. The SDK
+decodes whatever the host carries, so both shapes are read correctly; the
+table above describes the current contract source.
 
 ## Consequence for the telemetry listener
 

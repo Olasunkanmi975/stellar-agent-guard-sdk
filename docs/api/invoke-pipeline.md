@@ -37,6 +37,75 @@ const outcome = await invoke({
 * **How the fee multiplier works**: On each retry, the inclusion fee is scaled by `feeMultiplier` (e.g. 100 stroops → 200 stroops → 400 stroops) and re-added to the simulated resource fee. The multiplier must be a finite number greater than `1`.
 * **Guard and Simulation Invariant**: **Every fee-bump attempt is re-prepared, re-simulated, and re-evaluated by the guard policy.** A fee bump NEVER bypasses simulation or guard enforcement. If re-simulation causes a policy block, the policy block is immediately surfaced and the transaction is never broadcast.
 
+### The transaction hash, as soon as the server accepts the submission
+
+The transaction hash is the operator's recovery handle after the broadcast:
+it is what makes a transaction findable on an explorer when the SDK's own
+confirmation polling is slow, times out, or fails. `invoke()` therefore
+publishes it the moment the network answers, rather than only on the final
+outcome.
+
+```ts
+const outcome = await invoke({
+  server,
+  source,
+  call,
+  networkPassphrase,
+  onSubmitted: (event) => {
+    // `event.hash` is the hash the network assigned; `event.status` is the
+    // RPC's own status for the submission.
+    recordTransactionHash(event.hash);
+  },
+});
+```
+
+The hook is called exactly once, immediately after `sendTransaction` resolves
+and **before** any status polling, so a caller that records the hash keeps it
+whatever happens afterwards. A throwing hook is isolated: it cannot change the
+outcome, exactly like `onStep`.
+
+**The ambiguous case.** A broadcast response that names no transaction is
+reported as `hash: null` and **fails closed**: the SDK cannot poll for a
+transaction it cannot name, so the invocation returns its `error` outcome with
+a typed `BroadcastError` instead of claiming an untrackable transaction is on
+its way. `hash: null` is the honest answer — "accepted, but not trackable".
+
+**Keeping the hash on failure.** Every outcome that happened *after* a
+broadcast carries the hash, so a caller never has to scrape it out of an error
+string or a log line:
+
+| Outcome | Where the hash is |
+| --- | --- |
+| `allowed` | `outcome.submission.hash` |
+| `blocked` (post-broadcast refusal) | `outcome.transactionHash` |
+| `error` (failed poll, rejected transaction) | `outcome.transactionHash` |
+| `error` (deadline spent while polling) | `outcome.transactionHash` |
+| `InvokeRetryError` (retry budget exhausted) | `outcome.transactionHash` |
+
+A `deadline` that fires while the pipeline is waiting for an inclusion does
+not un-send the transaction: it may still land. The hash travels with the
+`RpcTimeoutError` for exactly that reason.
+
+### Malformed simulation data
+
+A simulation response the SDK cannot trust is reported with the SDK's typed
+`ContractResponseError`, naming the field that was wrong and the stage that
+read it — never a native conversion error.
+
+```ts
+const outcome = await invoke({ server, source, call, networkPassphrase });
+if (outcome.kind === "error" && outcome.error instanceof ContractResponseError) {
+  outcome.error.field;  // e.g. "minResourceFee"
+  outcome.error.stage;  // e.g. "assemble" | "simulate" | "preflight"
+}
+```
+
+The resource fee is the case in point: it is read through the shared exact-u64
+parser, so a missing, malformed, negative or out-of-range fee is rejected
+instead of being converted. The pipeline stops before the broadcast, and a dry
+run reports `undetermined` rather than an admissible verdict with a fabricated
+price.
+
 ### Option validation
 
 Every caller-controlled option is checked at the public `invoke()` boundary,

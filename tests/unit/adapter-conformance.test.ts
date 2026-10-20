@@ -473,6 +473,45 @@ describe("observer isolation (issue #313)", () => {
       assert.notEqual(result, "timeout", "the adapter awaited an observer hook");
       assert.equal((result as Outcome).entered, 0);
     });
+
+    it(`${adapter.name}: a failing onDecision cannot stop an admissible handler`, async () => {
+      const unhandled: unknown[] = [];
+      const onUnhandled = (reason: unknown) => unhandled.push(reason);
+      process.on("unhandledRejection", onUnhandled);
+      try {
+        const failures: Observer[] = [
+          {
+            onDecision: () => {
+              throw new Error("sync decision failure");
+            },
+          },
+          { onDecision: () => Promise.reject(new Error("async decision failure")) },
+        ];
+
+        for (const observer of failures) {
+          const logged: unknown[][] = [];
+          const logger: BlockedHookLogger = {
+            error: (...args) => {
+              logged.push(args);
+            },
+          };
+          const outcome = await adapter.run(SCENARIOS[0]!, { ...observer, logger });
+
+          assert.equal(outcome.entered, 1, "an observer failure suppressed an allowed action");
+          assert.equal(outcome.halted, false);
+          assert.doesNotMatch(outcome.refusal, /blocked|could not determine|refus/i);
+          assert.match(
+            String(logged[0]?.[0] ?? ""),
+            /onDecision/,
+            "a swallowed observer failure must name the hook when a logger is supplied",
+          );
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+      } finally {
+        process.off("unhandledRejection", onUnhandled);
+      }
+      assert.deepEqual(unhandled, [], "an observer rejection escaped as unhandled");
+    });
   }
 });
 

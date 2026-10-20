@@ -36,6 +36,7 @@
  */
 import { resolveLogger, type GuardLogger, type GuardLoggerInput } from "./logger.ts";
 import { SorobanDataBuilder, scValToNative, type xdr } from "@stellar/stellar-sdk";
+import { InvalidFeeCeilingError } from "./errors.ts";
 import { INCLUSION_FEE } from "./tx.ts";
 import type { PreFlightDecision, PreFlightInterceptor } from "./preflight.ts";
 import type { ContractCall } from "./tx.ts";
@@ -69,8 +70,32 @@ export interface PolicyContext {
 export const STROOPS_PER_XLM = 10_000_000n;
 
 /**
- * Render a fee in stroops as an XLM decimal string, using **integer arithmetic
- * only**.
+ * Validate a fee ceiling without collapsing "omitted" into "zero".
+ *
+ * Only `undefined` means "no ceiling"; a caller that passes `0n` has chosen a
+ * real, maximally strict policy and it must survive. Anything that is not a
+ * non-negative `bigint` — including a `number`, a numeric string or `null` — is
+ * rejected with a typed input error before any simulation runs.
+ */
+function validateFeeCeiling(value: unknown, field = "maxFeeStroops"): bigint {
+  if (typeof value !== "bigint" || value < 0n) {
+    throw new InvalidFeeCeilingError(field, value);
+  }
+  return value;
+}
+
+/**
+ * Render a **non-negative** fee in stroops as an XLM decimal string, using
+ * **integer arithmetic only**.
+ *
+ * ## Why negative values are refused
+ *
+ * This is a fee formatter, not a generic signed-unit formatter: a fee quote is
+ * never negative on Stellar, so a negative input is an upstream sign error.
+ * Formatting it as `-0.0000001` would put an impossible value into a log or UI
+ * where it looks authoritative. `formatFee` therefore throws `TypeError` for a
+ * negative `bigint` or a string carrying a sign, rather than inventing a
+ * negative amount.
  *
  * ## Why there is no floating point here
  *
@@ -94,34 +119,40 @@ export const STROOPS_PER_XLM = 10_000_000n;
  * in both directions, so `formatFee(parse(x)) === x` holds for every value this
  * function accepts.
  *
- * Input is `bigint` (exact, and the only way to express values above 2^53) or a
- * base-10 integer string. A `number` is rejected outright rather than coerced:
- * by the time it reaches this function any precision loss has already happened,
- * and accepting it would launder that loss into output that looks authoritative.
+ * Input is `bigint` (exact, and the only way to express values above 2^53) or an
+ * unsigned base-10 integer string. A `number` is rejected outright rather than
+ * coerced: by the time it reaches this function any precision loss has already
+ * happened, and accepting it would launder that loss into output that looks
+ * authoritative.
  */
 export function formatFee(stroops: bigint | string): string {
   const value = parseStroops(stroops);
-  const negative = value < 0n;
-  const magnitude = negative ? -value : value;
 
-  const whole = magnitude / STROOPS_PER_XLM;
-  const fraction = magnitude % STROOPS_PER_XLM;
+  const whole = value / STROOPS_PER_XLM;
+  const fraction = value % STROOPS_PER_XLM;
 
   // Exact decimal digits: pad to 7 places, then drop trailing zeros. String
   // padding is the whole trick — it is the step that would silently become a
   // rounding operation if any of this were done in floating point.
   const fractionDigits = fraction.toString().padStart(7, "0").replace(/0+$/, "");
-  const body = fractionDigits.length === 0 ? whole.toString() : `${whole}.${fractionDigits}`;
-  return negative ? `-${body}` : body;
+  return fractionDigits.length === 0 ? whole.toString() : `${whole}.${fractionDigits}`;
 }
 
 /** Parse and reject fee input without ever routing it through `Number`. */
 function parseStroops(stroops: bigint | string): bigint {
-  if (typeof stroops === "bigint") return stroops;
+  if (typeof stroops === "bigint") {
+    if (stroops < 0n) {
+      throw new TypeError(
+        `formatFee expects a non-negative fee in stroops, got ${stroops}n ` +
+          `(a fee quote cannot be negative; a negative value is an upstream sign error)`,
+      );
+    }
+    return stroops;
+  }
   if (typeof stroops === "string") {
-    if (/^-?\d+$/.test(stroops)) return BigInt(stroops);
+    if (/^\d+$/.test(stroops)) return BigInt(stroops);
     throw new TypeError(
-      `formatFee expects a base-10 integer stroops value, got ${JSON.stringify(stroops)} ` +
+      `formatFee expects a non-negative base-10 integer stroops value, got ${JSON.stringify(stroops)} ` +
         `(fee math is integer-only: XLM has 7 decimals, and binary floating point cannot ` +
         `represent them exactly)`,
     );
@@ -268,7 +299,12 @@ export interface CostPreCheckConfig {
   interceptor: Pick<PreFlightInterceptor, "check">;
   /**
    * Refuse (as `over_budget`) when the estimated *total* fee exceeds this many
-   * stroops. Omitted means "price it, never object to the price".
+   * stroops. Must be a non-negative `bigint`; a negative, `number`, string or
+   * other value throws `InvalidFeeCeilingError` at construction.
+   *
+   * Omitted means "price it, never object to the price". `0n` is a real
+   * ceiling, distinct from omission: every quoted total (which includes the
+   * inclusion fee) is then over budget.
    */
   maxFeeStroops?: bigint | undefined;
   /**
@@ -302,6 +338,24 @@ export interface FeeBreakdown {
   totalFeeStroops: bigint;
 }
 
+/**
+ * Ledger marker for the snapshot a simulation-based quote describes.
+ *
+ * **Informational, not an execution guarantee.** Two quotes with the same
+ * provenance were priced against the same ledger state; a quote whose ledger is
+ * older than the current chain may no longer reflect what submission will
+ * charge. The SDK does not promise that a transaction will land in this ledger.
+ */
+export interface CostProvenance {
+  /**
+   * Ledger sequence the pricing simulation observed.
+   *
+   * Taken from that same simulation response (`latestLedger`), never from a
+   * second RPC read that could race ahead of the state that was actually priced.
+   */
+  ledger: number;
+}
+
 export type CostDecision =
   | ({
       kind: "within_budget";
@@ -312,6 +366,8 @@ export type CostDecision =
       feeCeilingStroops: bigint | null;
       /** Additive policy-relative context when a policy source is configured; null otherwise. */
       policyContext: PolicyContext | null;
+      /** Ledger snapshot this quote describes, or `null` when it was unavailable. */
+      provenance: CostProvenance | null;
     } & FeeBreakdown &
       CostResultBreakdown)
   | ({
@@ -321,6 +377,8 @@ export type CostDecision =
       footprintKeys: number;
       feeCeilingStroops: bigint;
       policyContext: PolicyContext | null;
+      /** Ledger snapshot this quote describes, or `null` when it was unavailable. */
+      provenance: CostProvenance | null;
     } & FeeBreakdown &
       CostResultBreakdown)
   | ({
@@ -335,6 +393,8 @@ export type CostDecision =
       inclusionFeeStroops: bigint;
       totalFeeStroops: bigint;
       policyContext: PolicyContext | null;
+      /** A refusal is not simulation-priced, so there is no ledger provenance. */
+      provenance: CostProvenance | null;
     } & CostResultBreakdown)
   | ({
       kind: "undetermined";
@@ -345,6 +405,8 @@ export type CostDecision =
       inclusionFeeStroops: bigint;
       totalFeeStroops: bigint;
       policyContext: PolicyContext | null;
+      /** No usable simulation means no ledger provenance. */
+      provenance: CostProvenance | null;
     } & CostResultBreakdown);
 
 /** Type alias matching documentation nomenclature. */
@@ -358,7 +420,11 @@ export interface CostPreCheckOptions {
   policySource?: string | PolicyConfig | null | undefined;
   /** Optional policy or contract address. Alias for `policySource`. */
   policy?: string | PolicyConfig | null | undefined;
-  /** Override the fee ceiling in stroops for this check. */
+  /**
+   * Override the fee ceiling in stroops for this check. Must be a non-negative
+   * `bigint`; invalid values throw `InvalidFeeCeilingError` before the
+   * interceptor is called. `0n` is a real ceiling, distinct from omission.
+   */
   maxFeeStroops?: bigint | undefined;
   /**
    * Caller-owned cancellation for the underlying enforced simulation. An
@@ -415,7 +481,7 @@ export function exceedsCeiling(
   ceilingStroops: bigint | null | undefined,
 ): boolean {
   if (ceilingStroops === null || ceilingStroops === undefined) return false;
-  return totalFeeStroops > ceilingStroops;
+  return totalFeeStroops > validateFeeCeiling(ceilingStroops);
 }
 
 /** A compact, log-friendly rendering of a cost decision. */
@@ -546,9 +612,16 @@ function computePolicyContext(
 export class CostPreChecker {
   private readonly config: CostPreCheckConfig;
   private readonly logger: GuardLogger;
+  private readonly maxFeeStroops: bigint | undefined;
 
   constructor(config: CostPreCheckConfig) {
     this.config = config;
+    // Validate at the configuration boundary: a typo must fail here, not turn
+    // every later quote into a fabricated over-budget answer.
+    this.maxFeeStroops =
+      config.maxFeeStroops === undefined
+        ? undefined
+        : validateFeeCeiling(config.maxFeeStroops);
     this.logger = resolveLogger(config.logger);
   }
 
@@ -582,6 +655,14 @@ export class CostPreChecker {
     call: ContractCall,
     options?: CostPreCheckOptions,
   ): Promise<CostWithDecision> {
+    // Resolve and validate the ceiling *before* the simulation: a bad budget
+    // policy must never spend an RPC or be masked by a guard verdict. Only an
+    // absent per-call ceiling falls back to configuration; 0n is preserved.
+    const ceiling =
+      options?.maxFeeStroops !== undefined
+        ? validateFeeCeiling(options.maxFeeStroops)
+        : this.maxFeeStroops ?? null;
+
     const decision = await this.config.interceptor.check(call, {
       signal: options?.signal,
       timeoutMs: options?.timeoutMs,
@@ -589,7 +670,6 @@ export class CostPreChecker {
     const policySource =
       options?.policySource ?? options?.policy ?? this.config.policySource ?? this.config.policy;
     const policyContext = computePolicyContext(policySource, decision, call);
-    const ceiling = options?.maxFeeStroops ?? this.config.maxFeeStroops ?? null;
     const cost = this.costOf(decision, policyContext, ceiling);
     // The one place a cost decision is produced, so the one place it is logged:
     // `check()` and both one-shot helpers funnel through here, and a second log
@@ -610,9 +690,13 @@ export class CostPreChecker {
   /** The pure cost view of an already-obtained verdict. No network, no state. */
   private costOf(
     decision: PreFlightDecision,
-    policyContext: PolicyContext | null = null,
-    ceiling: bigint | null = this.config.maxFeeStroops ?? null,
+    policyContext: PolicyContext | null,
+    ceiling: bigint | null,
   ): CostDecision {
+    // Provenance travels with the verdict from the same simulation. A block or
+    // an undetermined run has no priced snapshot, so it is explicitly null
+    // rather than an invented ledger marker.
+    const provenance = decision.kind === "admissible" ? decision.provenance ?? null : null;
     if (decision.kind === "blocked") {
       return {
         kind: "blocked",
@@ -624,6 +708,7 @@ export class CostPreChecker {
         inclusionFeeStroops: 0n,
         totalFeeStroops: 0n,
         policyContext,
+        provenance,
       };
     }
     if (decision.kind === "undetermined") {
@@ -635,6 +720,7 @@ export class CostPreChecker {
         inclusionFeeStroops: 0n,
         totalFeeStroops: 0n,
         policyContext,
+        provenance,
       };
     }
 
@@ -647,6 +733,7 @@ export class CostPreChecker {
         footprintKeys: decision.footprintKeys,
         feeCeilingStroops: ceiling as bigint,
         policyContext,
+        provenance,
         ...(decision.resourceBreakdown ? { breakdown: decision.resourceBreakdown } : {}),
       };
     }
@@ -657,6 +744,7 @@ export class CostPreChecker {
       footprintKeys: decision.footprintKeys,
       feeCeilingStroops: ceiling,
       policyContext,
+      provenance,
       ...(decision.resourceBreakdown ? { breakdown: decision.resourceBreakdown } : {}),
     };
   }

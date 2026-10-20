@@ -10,11 +10,14 @@ import {
   InvalidInputError,
   PreFlightInterceptor,
   PreFlightUndeterminedError,
+  preflight,
+  preflightBatch,
   validateContractCall,
   type PreFlightCacheOptions,
   type PreFlightDecision,
 } from "../../src/preflight.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
+import { ContractResponseError } from "../../src/errors.ts";
 import { GuardBlockedError } from "../../src/reasons.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
 import type { ContractCall } from "../../src/tx.ts";
@@ -90,6 +93,7 @@ function createMockServer(options?: {
       return (
         options?.simulateResponse ?? {
           minResourceFee: "100",
+          latestLedger: 123_456,
           result: {
             auth: [],
           },
@@ -113,6 +117,33 @@ function createTestInterceptor(server: rpc.Server) {
     source: Keypair.random(),
   });
 }
+
+describe("one-shot pre-flight helpers", () => {
+  function config() {
+    return {
+      server: createMockServer(),
+      networkPassphrase: "Test SDF Network ; September 2015",
+      guard: VALID_GUARD,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+    };
+  }
+
+  it("preflight() constructs an interceptor and checks one call", async () => {
+    const decision = await preflight(config(), validTransferCall());
+    assert.equal(decision.kind, "admissible");
+    assert.equal(
+      decision.kind === "admissible" ? decision.provenance?.ledger : undefined,
+      123_456,
+    );
+  });
+
+  it("preflightBatch() constructs an interceptor and checks a batch", async () => {
+    const decision = await preflightBatch(config(), []);
+    assert.equal(decision.overallAdmissible, true);
+    assert.equal(decision.calls.length, 0);
+  });
+});
 
 describe("validateContractCall validator unit tests", () => {
   describe("contract format validation", () => {
@@ -472,6 +503,99 @@ describe("boundary: valid-but-unusual inputs proceed to simulation", () => {
   });
 });
 
+describe("simulation ledger provenance (#347)", () => {
+  it("reports the ledger from the same simulation that produced the quote", async () => {
+    const mockServer = createMockServer();
+    const interceptor = createTestInterceptor(mockServer);
+
+    const decision = await interceptor.check(validTransferCall());
+
+    assert.equal(decision.kind, "admissible");
+    assert.deepEqual(decision.kind === "admissible" ? decision.provenance : undefined, {
+      ledger: 123_456,
+    });
+  });
+
+  it("omits provenance rather than inventing one when the response has no ledger", async () => {
+    const mockServer = createMockServer({
+      simulateResponse: {
+        minResourceFee: "100",
+        result: { auth: [] },
+        transactionData: {
+          getReadOnly: () => [],
+          getReadWrite: () => [],
+        },
+      },
+    });
+    const interceptor = createTestInterceptor(mockServer);
+
+    const decision = await interceptor.check(validTransferCall());
+
+    assert.equal(decision.kind, "admissible");
+    assert.equal(
+      decision.kind === "admissible" ? decision.provenance : "not-admissible",
+      undefined,
+    );
+  });
+
+  it("omits a malformed ledger instead of passing it through", async () => {
+    for (const latestLedger of [-1, 1.5, Number.NaN, "123", null]) {
+      const mockServer = createMockServer({
+        simulateResponse: {
+          minResourceFee: "100",
+          latestLedger,
+          result: { auth: [] },
+          transactionData: {
+            getReadOnly: () => [],
+            getReadWrite: () => [],
+          },
+        },
+      });
+      const interceptor = createTestInterceptor(mockServer);
+
+      const decision = await interceptor.check(validTransferCall());
+
+      assert.equal(decision.kind, "admissible");
+      assert.equal(
+        decision.kind === "admissible" ? decision.provenance : "not-admissible",
+        undefined,
+        `expected ${String(latestLedger)} to be omitted`,
+      );
+    }
+  });
+
+  it("never performs an additional ledger read to label the quote", async () => {
+    let latestLedgerCalls = 0;
+    const server = {
+      getAccount: async () => ({ sequenceNumber: () => "100" }),
+      getLatestLedger: async () => {
+        latestLedgerCalls += 1;
+        return { sequence: 999_999 };
+      },
+      simulateTransaction: async () => ({
+        minResourceFee: "100",
+        latestLedger: 500_000,
+        result: { auth: [] },
+        transactionData: {
+          getReadOnly: () => [],
+          getReadWrite: () => [],
+        },
+      }),
+    } as unknown as rpc.Server;
+    const interceptor = createTestInterceptor(server);
+
+    const decision = await interceptor.check(validTransferCall());
+
+    assert.equal(decision.kind, "admissible");
+    assert.deepEqual(decision.kind === "admissible" ? decision.provenance : undefined, {
+      ledger: 500_000,
+    });
+    // The check already reads the current ledger once for its cache context;
+    // provenance must add no further read and must not use that value.
+    assert.equal(latestLedgerCalls, 1, "provenance must come from the pricing simulation");
+  });
+});
+
 describe("throw vs verdict contract asymmetry", () => {
   it("programmer error (invalid input) throws InvalidInputError", async () => {
     const mockServer = createMockServer();
@@ -571,9 +695,64 @@ describe("throw vs verdict contract asymmetry", () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*             Unit tests for opt-in pre-flight simulation cache              */
+/*             Pre-flight resource-fee handling (fail closed)                 */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A malformed resource fee must fail the way every other malformed contract
+ * response fails: with the SDK's typed `ContractResponseError`, naming the
+ * field and the stage, and with the verdict `undetermined` — never
+ * `admissible`, because an unpriceable simulation must not produce a budget
+ * decision.
+ */
+describe("pre-flight resource-fee handling", () => {
+  function serverWithFee(minResourceFee: unknown) {
+    return createMockServer({
+      enforcedSimulateResponse: {
+        minResourceFee,
+        result: { auth: [] },
+        transactionData: {
+          getReadOnly: () => [],
+          getReadWrite: () => [],
+        },
+      },
+    });
+  }
+
+  it("reports a missing, malformed, negative or out-of-range fee as undetermined", async () => {
+    for (const value of [undefined, null, "", "not-a-fee", "1.5", -1, 2n ** 64n]) {
+      const server = serverWithFee(value);
+      const interceptor = createTestInterceptor(server);
+
+      const decision = await interceptor.check(validTransferCall());
+
+      assert.equal(decision.kind, "undetermined");
+      assert.ok(
+        decision.error instanceof ContractResponseError,
+        `expected a ContractResponseError for ${String(value)}`,
+      );
+      assert.equal(decision.error.field, "minResourceFee");
+      assert.equal(decision.error.stage, "preflight");
+      assert.equal(decision.allowed, false);
+    }
+  });
+
+  it("accepts the fee in every representation the SDK may hand back", async () => {
+    for (const value of ["42", 42, 42n]) {
+      const server = serverWithFee(value);
+      const interceptor = createTestInterceptor(server);
+
+      const decision = await interceptor.check(validTransferCall());
+
+      assert.equal(decision.kind, "admissible");
+      assert.equal(decision.kind === "admissible" ? decision.estimatedResourceFee : undefined, 42n);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/*             Unit tests for opt-in pre-flight simulation cache              */
+/* -------------------------------------------------------------------------- */
 const CONTRACT = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
 const OTHER_CONTRACT = unsafeContractAddress(Address.contract(Buffer.alloc(32)).toString());
 const NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";

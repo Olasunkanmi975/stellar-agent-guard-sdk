@@ -111,6 +111,23 @@
       ]
     },
     {
+      "name": "blocked_no_pending_admin",
+      "result": "blocked",
+      "reason": "no_pending_admin",
+      "code": 6,
+      "stream": "diagnostic",
+      "topics": [
+        "event_auth_checked",
+        "blocked",
+        "no_pending_admin"
+      ],
+      "topicsXdr": [
+        "AAAADwAAABJldmVudF9hdXRoX2NoZWNrZWQAAA==",
+        "AAAADwAAAAdibG9ja2VkAA==",
+        "AAAADwAAABBub19wZW5kaW5nX2FkbWlu"
+      ]
+    },
+    {
       "name": "blocked_admin_frozen",
       "result": "blocked",
       "reason": "admin_frozen",
@@ -346,6 +363,91 @@
         "AAAADwAAABJldmVudF9hdXRoX2NoZWNrZWQAAA==",
         "AAAADwAAAAdibG9ja2VkAA==",
         "AAAADwAAABtjcmVhdGVfY29udHJhY3Rfbm90X2FsbG93ZWQA"
+      ]
+    },
+    {
+      "name": "blocked_recipient_blocked",
+      "result": "blocked",
+      "reason": "recipient_blocked",
+      "code": 29,
+      "stream": "diagnostic",
+      "topics": [
+        "event_auth_checked",
+        "blocked",
+        "recipient_blocked"
+      ],
+      "topicsXdr": [
+        "AAAADwAAABJldmVudF9hdXRoX2NoZWNrZWQAAA==",
+        "AAAADwAAAAdibG9ja2VkAA==",
+        "AAAADwAAABFyZWNpcGllbnRfYmxvY2tlZAAAAA=="
+      ]
+    },
+    {
+      "name": "blocked_protocol_call_rate_exceeded",
+      "result": "blocked",
+      "reason": "protocol_call_rate_exceeded",
+      "code": 30,
+      "stream": "diagnostic",
+      "topics": [
+        "event_auth_checked",
+        "blocked",
+        "protocol_call_rate_exceeded"
+      ],
+      "topicsXdr": [
+        "AAAADwAAABJldmVudF9hdXRoX2NoZWNrZWQAAA==",
+        "AAAADwAAAAdibG9ja2VkAA==",
+        "AAAADwAAABtwcm90b2NvbF9jYWxsX3JhdGVfZXhjZWVkZWQA"
+      ]
+    },
+    {
+      "name": "blocked_decision_invariant_violation",
+      "result": "blocked",
+      "reason": "decision_invariant_violation",
+      "code": 31,
+      "stream": "diagnostic",
+      "topics": [
+        "event_auth_checked",
+        "blocked",
+        "decision_invariant_violation"
+      ],
+      "topicsXdr": [
+        "AAAADwAAABJldmVudF9hdXRoX2NoZWNrZWQAAA==",
+        "AAAADwAAAAdibG9ja2VkAA==",
+        "AAAADwAAABxkZWNpc2lvbl9pbnZhcmlhbnRfdmlvbGF0aW9u"
+      ]
+    },
+    {
+      "name": "blocked_asset_fn_not_allowed",
+      "result": "blocked",
+      "reason": "asset_fn_not_allowed",
+      "code": 32,
+      "stream": "diagnostic",
+      "topics": [
+        "event_auth_checked",
+        "blocked",
+        "asset_fn_not_allowed"
+      ],
+      "topicsXdr": [
+        "AAAADwAAABJldmVudF9hdXRoX2NoZWNrZWQAAA==",
+        "AAAADwAAAAdibG9ja2VkAA==",
+        "AAAADwAAABRhc3NldF9mbl9ub3RfYWxsb3dlZA=="
+      ]
+    },
+    {
+      "name": "blocked_too_many_auth_contexts",
+      "result": "blocked",
+      "reason": "too_many_auth_contexts",
+      "code": 33,
+      "stream": "diagnostic",
+      "topics": [
+        "event_auth_checked",
+        "blocked",
+        "too_many_auth_contexts"
+      ],
+      "topicsXdr": [
+        "AAAADwAAABJldmVudF9hdXRoX2NoZWNrZWQAAA==",
+        "AAAADwAAAAdibG9ja2VkAA==",
+        "AAAADwAAABZ0b29fbWFueV9hdXRoX2NvbnRleHRzAAA="
       ]
     }
   ]

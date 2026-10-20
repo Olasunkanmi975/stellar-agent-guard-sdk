@@ -63,9 +63,12 @@ import {
   type AdminSigner,
   type AgentSigner,
   type ContractCall,
+  type SubmissionAcceptedEvent,
   type SubmissionResult,
   toAgentSigner,
 } from "./tx.ts";
+
+export type { SubmissionAcceptedEvent } from "./tx.ts";
 
 /** How the guard's authorization is produced for a call that needs it. */
 export interface GuardAuthorization {
@@ -115,12 +118,22 @@ export class RpcTimeoutError extends GuardError {
   readonly deadline: boolean;
   /** The budget that fired, in milliseconds; absent when the bound was a signal abort. */
   readonly timeoutMs?: number | undefined;
+  /**
+   * The transaction hash, when the bound fired *after* the transaction was
+   * broadcast.
+   *
+   * A bound that fires while the pipeline is waiting for an inclusion does not
+   * un-send the transaction: it may still land. Carrying the hash here is what
+   * lets the caller look it up instead of parsing the error text.
+   */
+  readonly transactionHash?: string | undefined;
 
   constructor(params: {
     stage: string;
     aborted: boolean;
     timeoutMs?: number;
     deadline?: boolean;
+    transactionHash?: string;
   }) {
     const reason = params.aborted
       ? "aborted by caller signal"
@@ -135,6 +148,7 @@ export class RpcTimeoutError extends GuardError {
     this.aborted = params.aborted;
     this.deadline = params.deadline === true;
     if (params.timeoutMs !== undefined) this.timeoutMs = params.timeoutMs;
+    if (params.transactionHash !== undefined) this.transactionHash = params.transactionHash;
   }
 }
 
@@ -250,6 +264,16 @@ export interface InvokeErrorOutcome {
   error: GuardError;
   /** Diagnostic events the host bundled with the failure, if any. */
   diagnosticEvents: unknown[];
+  /**
+   * The transaction hash, when the failure happened *after* the transaction was
+   * broadcast.
+   *
+   * This is the operator's recovery handle: a failed status poll, a spent
+   * deadline or a post-inclusion rejection all leave the transaction on the
+   * network, and the hash is what lets the caller look it up. It is absent when
+   * nothing was broadcast.
+   */
+  transactionHash?: string | undefined;
   /** Coarse cause; absent for a dry run because no failure was classified. */
   cause?: InvokeErrorCause;
   /** Set when a re-simulation against fresh state can fix the failure. */
@@ -288,6 +312,17 @@ export class InvokeRetryError extends Error {
   readonly retryable?: undefined;
   /** Structured retry metadata; always present on an exhausted invocation. */
   readonly retry: InvokeRetryMetadata;
+  /**
+   * The transaction hash of the last attempt, when that attempt had broadcast
+   * one.
+   *
+   * A retry budget that runs out still leaves the last transaction on the
+   * network, so the hash — the operator's recovery handle — travels with the
+   * exhausted outcome rather than only with the attempt that failed.
+   */
+  get transactionHash(): string | undefined {
+    return this.lastOutcome.transactionHash;
+  }
 
   constructor(params: {
     attempts: number;
@@ -523,6 +558,22 @@ export interface InvokeParams {
    * consumer does with the events is entirely the consumer's business.
    */
   onStep?: ((step: InvokeStepEvent) => void) | undefined;
+  /**
+   * Optional hook called **once**, with the network's answer to the
+   * broadcast, before any status polling.
+   *
+   * The transaction hash is the operator's recovery handle: it is what makes a
+   * transaction findable on an explorer when the SDK's own polling is slow,
+   * times out or fails. This hook publishes it as soon as the server accepts
+   * the submission, so a caller can keep it even when the invocation never
+   * returns a successful outcome.
+   *
+   * The event carries `hash: null` when the broadcast response was ambiguous
+   * and named no transaction; that submission fails closed rather than being
+   * reported as submitted. A throwing hook is isolated and cannot change the
+   * outcome.
+   */
+  onSubmitted?: ((event: SubmissionAcceptedEvent) => void) | undefined;
   /**
    * Optional log sink. Omitted — the default — `invoke()` writes nothing
    * anywhere: no console output, no stdout or stderr, no implicit
@@ -1608,7 +1659,9 @@ async function invokeDryRun(
 
   if (enforced.kind === "admissible") {
     try {
-      resourceFee = parseSimulationResourceFee(enforced.simulation.minResourceFee);
+      resourceFee = parseSimulationResourceFee(enforced.simulation.minResourceFee, {
+        stage: "simulate",
+      });
     } catch (cause) {
       // The guard approved, but the network's own price for it is unusable.
       // Reporting `admissible` here would hand the caller a fee figure that
@@ -1749,10 +1802,17 @@ async function invokePipeline(
     return {
       kind: "error",
       detail,
-      error: new SimulationError("could not assemble transaction from enforced simulation", {
-        stage: "simulate",
-        cause,
-      }),
+      // A malformed simulation is reported with the SDK's own typed error, so
+      // the field that was wrong (`minResourceFee`) and the stage that read it
+      // survive to the caller instead of being flattened into a generic
+      // simulation failure — or, worse, escaping as a native conversion error.
+      error:
+        cause instanceof ContractResponseError
+          ? cause
+          : new SimulationError("could not assemble transaction from enforced simulation", {
+              stage: "simulate",
+              cause,
+            }),
       diagnosticEvents: [],
     };
   }
@@ -1775,6 +1835,10 @@ async function invokePipeline(
           pollIntervalMs: poll.pollIntervalMs,
           clock: options?.clock,
           deadlineAt: options?.deadline?.at,
+          // The hash is published the moment the network accepts the
+          // submission, so a caller can keep it even when the polling that
+          // follows fails or runs out of budget.
+          ...(params.onSubmitted ? { onSubmitted: params.onSubmitted } : {}),
         }),
       (result) => result.failure !== null,
     );
@@ -1787,13 +1851,25 @@ async function invokePipeline(
       detail: typed.message,
       error: typed,
       diagnosticEvents: [],
+      // The transaction was broadcast before the failure, so its hash is the
+      // caller's recovery handle: a poll that failed, a transport error or an
+      // ambiguous broadcast must not take it away.
+      ...(typed instanceof BroadcastError && typed.transactionHash
+        ? { transactionHash: typed.transactionHash }
+        : {}),
     };
   }
   if (submission.deadlineExceeded) {
     // The transaction may still land; the caller's budget is nevertheless spent,
     // and reporting that as a normal broadcast failure would invite a retry the
-    // deadline was meant to prevent.
-    throw new RpcTimeoutError({ stage: "poll", aborted: false, deadline: true });
+    // deadline was meant to prevent. The hash travels with the error, so the
+    // caller can still look the transaction up.
+    throw new RpcTimeoutError({
+      stage: "poll",
+      aborted: false,
+      deadline: true,
+      transactionHash: submission.hash,
+    });
   }
   if (submission.failure) {
     // A post-broadcast rejection is a hard error, not a policy block: the
@@ -1828,6 +1904,9 @@ async function invokePipeline(
       detail,
       error: new BroadcastError(detail, { transactionHash: submission.hash }),
       diagnosticEvents: events,
+      // The transaction was included and then rejected: the hash is how the
+      // caller finds it on-chain.
+      transactionHash: submission.hash,
       cause: staleLedger
         ? INVOKE_ERROR_CAUSES.staleLedgerResourceLimit
         : sequenceCollision
@@ -2262,5 +2341,9 @@ export function timeoutOutcome(error: RpcTimeoutError): InvokeErrorOutcome {
     detail: error.message,
     error,
     diagnosticEvents: [],
+    // A bound that fired after the broadcast leaves the transaction on the
+    // network; the hash travels with the outcome so the caller can reconcile
+    // it out of band.
+    ...(error.transactionHash !== undefined ? { transactionHash: error.transactionHash } : {}),
   };
 }

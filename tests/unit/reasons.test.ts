@@ -6,6 +6,12 @@
  * `Error(Contract, #22)` into `per_tx_cap_exceeded`, and a table that drifts from
  * `stellar-agent-guard-contracts/src/types.rs` would silently mislabel every
  * refusal.
+ *
+ * The matrix itself is **not** copied into this file. It is read from the
+ * contracts repo's own vocabulary fixture, vendored at
+ * `tests/fixtures/vendor/auth-checked-vocabulary.json`, so a reason the
+ * contract adds fails this test until the SDK's table is extended — instead of
+ * being silently accepted by a second, hand-maintained copy.
  */
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
@@ -26,31 +32,33 @@ import {
 } from "../../src/reasons.ts";
 import { unsafeContractAddress } from "../../src/policy.ts";
 
+/**
+ * The contract's own vocabulary, read from the vendored contracts fixture.
+ *
+ * `Allowed` is the one outcome without an `Error` code, so it contributes no
+ * reason; every other outcome is one reason symbol with its numeric code.
+ */
+function contractReasonCodes(): Record<string, number> {
+  const path = resolve(process.cwd(), "tests/fixtures/vendor/auth-checked-vocabulary.json");
+  const doc = JSON.parse(readFileSync(path, "utf8")) as {
+    vocabulary: {
+      outcomes: Array<{ symbol: string; code: number | null }>;
+    };
+  };
+  const codes: Record<string, number> = {};
+  for (const outcome of doc.vocabulary.outcomes) {
+    if (outcome.code === null) continue;
+    codes[outcome.symbol] = outcome.code;
+  }
+  return codes;
+}
+
 describe("reason code table", () => {
   it("matches the contract's Error enum exactly", () => {
-    // Transcribed from stellar-agent-guard-contracts/src/types.rs `enum Error`.
-    // If this fails, the SDK is describing a different contract.
-    assert.deepEqual(GUARD_REASON_CODES, {
-      unauthorized: 1,
-      already_initialized: 2,
-      not_initialized: 3,
-      invalid_config: 4,
-      invalid_amount: 5,
-      admin_frozen: 10,
-      heartbeat_expired: 11,
-      no_policy: 12,
-      paused: 13,
-      outside_active_window: 14,
-      asset_not_allowed: 20,
-      recipient_not_allowed: 21,
-      per_tx_cap_exceeded: 22,
-      window_cap_exceeded: 23,
-      protocol_not_allowed: 24,
-      function_not_allowed: 25,
-      unknown_contract: 26,
-      self_function_not_allowed: 27,
-      create_contract_not_allowed: 28,
-    });
+    // Read from the contracts repo's fixture, not from a second copy of the
+    // matrix kept in this repository. If this fails, the SDK is describing a
+    // different contract — or the contract added a reason.
+    assert.deepEqual({ ...GUARD_REASON_CODES }, contractReasonCodes());
   });
 
   it("has no duplicate numeric codes", () => {
@@ -148,6 +156,7 @@ const GOLDEN_EXPLANATIONS: Record<GuardReason, string> = {
   not_initialized: "The guard account has no registered agent key yet.",
   invalid_config: "The policy configuration was rejected by validation and was not applied.",
   invalid_amount: "The transfer amount was zero or negative.",
+  no_pending_admin: "The account has no pending admin rotation to confirm or cancel.",
   admin_frozen: "An admin froze the account (freeze), or the dead-man switch grace window lapsed.",
   heartbeat_expired: "The dead-man switch fired: no heartbeat within the policy's grace window, so the account is frozen until an admin unfreezes it.",
   no_policy: "No policy is installed (never set, or revoked) — the account is default-deny.",
@@ -162,6 +171,11 @@ const GOLDEN_EXPLANATIONS: Record<GuardReason, string> = {
   unknown_contract: "The contract being called is neither the account itself, an allowlisted asset, nor an allowlisted protocol (default deny).",
   self_function_not_allowed: "The call targets a guard function that the agent key may not invoke.",
   create_contract_not_allowed: "The account may not authorize contract creation.",
+  recipient_blocked: "The transfer recipient is explicitly blocked by the account's policy.",
+  protocol_call_rate_exceeded: "The call would push the rolling protocol-call count past its configured limit.",
+  decision_invariant_violation: "The guard's decision engine hit an internal invariant, so the call was refused rather than allowed.",
+  asset_fn_not_allowed: "The call invoked a function other than `transfer` on an allowlisted asset.",
+  too_many_auth_contexts: "The call carried more authorization contexts than the guard's decision engine evaluates.",
 };
 
 describe("explainReason golden snapshot (issue #96)", () => {

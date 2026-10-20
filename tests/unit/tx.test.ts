@@ -12,10 +12,22 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { describe, it } from "node:test";
-import { Address, Keypair, SorobanDataBuilder, scValToNative, xdr } from "@stellar/stellar-sdk";
+import {
+  Account,
+  Address,
+  Keypair,
+  Operation,
+  SorobanDataBuilder,
+  Transaction,
+  TransactionBuilder,
+  rpc,
+  scValToNative,
+  xdr,
+} from "@stellar/stellar-sdk";
 import { ContractResponseError, SigningError } from "../../src/errors.ts";
 import {
   BroadcastError,
+  assembleFromSimulation,
   buildGuardAuthEntry,
   describeSimulationResources,
   isMinimumFeeBroadcastFailure,
@@ -24,11 +36,13 @@ import {
   isStaleLedgerResourceFailure,
   keypairAgentSigner,
   parseSimulationResourceFee,
+  submitAndPoll,
   toAgentSigner,
   validateAgentPublicKey,
   verifyAgentSignature,
   type AgentSigner,
   type ContractCall,
+  type SubmissionAcceptedEvent,
 } from "../../src/tx.ts";
 import { unsafeContractAddress } from "../../src/policy.ts";
 
@@ -38,6 +52,7 @@ const CALL: ContractCall = {
   fn: "transfer",
   args: [],
 };
+const PASSPHRASE = "Test SDF Network ; September 2015";
 
 /** The real failure payload from the live testnet run, trimmed. */
 const staleLedgerFailure = {
@@ -133,6 +148,187 @@ describe("parseSimulationResourceFee", () => {
         },
       );
     }
+  });
+
+  it("records the stage that read the fee, so the failure says where it happened", () => {
+    assert.throws(
+      () => parseSimulationResourceFee("not-a-fee", { stage: "assemble" }),
+      (error: unknown) => {
+        assert.ok(error instanceof ContractResponseError);
+        assert.equal(error.field, "minResourceFee");
+        assert.equal(error.stage, "assemble");
+        return true;
+      },
+    );
+  });
+
+  it("leaves the stage absent when the caller names none", () => {
+    try {
+      parseSimulationResourceFee("not-a-fee");
+      assert.fail("expected a ContractResponseError");
+    } catch (error) {
+      assert.ok(error instanceof ContractResponseError);
+      assert.equal(error.stage, undefined);
+    }
+  });
+});
+
+/**
+ * A simulation payload whose only interesting field is the resource fee.
+ *
+ * The rest of the shape is what the assembler needs to build a transaction, so
+ * a malformed fee is the *only* thing wrong with it — which is what makes the
+ * failure attributable to the fee and nothing else.
+ */
+function simulationWithFee(minResourceFee: unknown): rpc.Api.SimulateTransactionSuccessResponse {
+  return {
+    minResourceFee,
+    transactionData: new SorobanDataBuilder().build().toXDR(),
+    result: { auth: [] },
+  } as unknown as rpc.Api.SimulateTransactionSuccessResponse;
+}
+
+describe("assembleFromSimulation resource-fee handling", () => {
+  const operation = Operation.invokeContractFunction({
+    contract: CALL.contract,
+    function: CALL.fn,
+    args: [],
+  });
+
+  function assemble(minResourceFee: unknown) {
+    return assembleFromSimulation({
+      simulation: simulationWithFee(minResourceFee),
+      source: new Account(Keypair.random().publicKey(), "100"),
+      operation,
+      networkPassphrase: PASSPHRASE,
+      guard: null,
+    });
+  }
+
+  it("accepts the fee in every representation the SDK may hand back", () => {
+    assert.equal(assemble("42").resourceFee, 42n);
+    assert.equal(assemble(42).resourceFee, 42n);
+    assert.equal(assemble(42n).resourceFee, 42n);
+  });
+
+  it("rejects a malformed fee with the typed contract-response error, not a native conversion error", () => {
+    for (const value of [undefined, null, "", "not-a-fee", "1.5", -1, 2n ** 64n]) {
+      assert.throws(
+        () => assemble(value),
+        (error: unknown) => {
+          assert.ok(
+            error instanceof ContractResponseError,
+            `expected a ContractResponseError for ${String(value)}`,
+          );
+          assert.equal(error.field, "minResourceFee");
+          assert.equal(error.stage, "assemble");
+          return true;
+        },
+      );
+    }
+  });
+});
+
+/** A signed-shaped transaction, enough for the submission path. */
+function buildTestTransaction(): Transaction {
+  return new TransactionBuilder(new Account(Keypair.random().publicKey(), "100"), {
+    fee: "100",
+    networkPassphrase: PASSPHRASE,
+  })
+    .addOperation(
+      Operation.invokeContractFunction({
+        contract: CALL.contract,
+        function: CALL.fn,
+        args: [],
+      }),
+    )
+    .setTimeout(0)
+    .build();
+}
+
+describe("submitAndPoll: the submission is reported before any polling", () => {
+  const HASH = "a".repeat(64);
+
+  it("publishes the hash the moment the network accepted the submission", async () => {
+    const events: SubmissionAcceptedEvent[] = [];
+    const order: string[] = [];
+    const server = {
+      async sendTransaction() {
+        order.push("send");
+        return { status: "PENDING", hash: HASH };
+      },
+      async getTransaction(hash: string) {
+        order.push(`poll:${hash}`);
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 42 };
+      },
+    } as unknown as rpc.Server;
+
+    const result = await submitAndPoll(server, buildTestTransaction(), [], {
+      pollAttempts: 1,
+      pollIntervalMs: 0,
+      onSubmitted: (event) => {
+        order.push("submitted");
+        events.push(event);
+      },
+    });
+
+    assert.deepEqual(events, [{ hash: HASH, status: "PENDING" }]);
+    assert.deepEqual(order, ["send", "submitted", `poll:${HASH}`]);
+    assert.equal(result.hash, HASH);
+  });
+
+  it("reports an ambiguous response — no hash — and fails closed", async () => {
+    const events: SubmissionAcceptedEvent[] = [];
+    let polls = 0;
+    const server = {
+      async sendTransaction() {
+        return { status: "PENDING", hash: "" };
+      },
+      async getTransaction() {
+        polls += 1;
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 42 };
+      },
+    } as unknown as rpc.Server;
+
+    await assert.rejects(
+      () =>
+        submitAndPoll(server, buildTestTransaction(), [], {
+          pollAttempts: 1,
+          pollIntervalMs: 0,
+          onSubmitted: (event) => events.push(event),
+        }),
+      (error: unknown) => {
+        assert.ok(error instanceof BroadcastError);
+        assert.equal(error.transactionHash, null);
+        assert.match(error.message, /no transaction hash/);
+        return true;
+      },
+    );
+
+    assert.deepEqual(events, [{ hash: null, status: "PENDING" }]);
+    assert.equal(polls, 0, "an untrackable transaction must not be polled for");
+  });
+
+  it("isolates a throwing hook: the submission still completes", async () => {
+    const server = {
+      async sendTransaction() {
+        return { status: "PENDING", hash: HASH };
+      },
+      async getTransaction() {
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 42 };
+      },
+    } as unknown as rpc.Server;
+
+    const result = await submitAndPoll(server, buildTestTransaction(), [], {
+      pollAttempts: 1,
+      pollIntervalMs: 0,
+      onSubmitted: () => {
+        throw new Error("consumer exploded");
+      },
+    });
+
+    assert.equal(result.hash, HASH);
+    assert.equal(result.failure, null);
   });
 });
 

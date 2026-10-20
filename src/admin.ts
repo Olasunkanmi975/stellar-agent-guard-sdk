@@ -95,6 +95,24 @@ export interface AdminOpParams {
   dryRun?: boolean | undefined;
   pollAttempts?: number | undefined;
   pollIntervalMs?: number | undefined;
+  /**
+   * Caller-owned cancellation, forwarded to `invoke()` unchanged.
+   *
+   * An already-aborted signal short-circuits before any RPC call and produces
+   * the same documented typed outcome an aborted `invoke()` produces: the
+   * `error` arm carrying an `RpcTimeoutError` with `aborted: true`. A
+   * mid-flight abort stops the operation at the next RPC boundary.
+   *
+   * Cancellation never relaxes the guard: it can only stop the SDK from
+   * waiting, never turn a refusal into an approval.
+   */
+  signal?: AbortSignal | undefined;
+  /**
+   * Bound on each individual RPC call, in milliseconds, forwarded to
+   * `invoke()` unchanged. Defaults to `DEFAULT_RPC_TIMEOUT_MS` (30s); pass
+   * `0` to disable the bound and rely solely on `signal`.
+   */
+  timeoutMs?: number | undefined;
 }
 
 export interface SetPolicyParams extends AdminOpParams {
@@ -120,6 +138,8 @@ export async function submitSetPolicy(params: SetPolicyParams): Promise<InvokeOu
     dryRun: params.dryRun,
     pollAttempts: params.pollAttempts,
     pollIntervalMs: params.pollIntervalMs,
+    signal: params.signal,
+    timeoutMs: params.timeoutMs,
   });
 }
 
@@ -137,6 +157,8 @@ export async function submitFreeze(params: AdminOpParams): Promise<InvokeOutcome
     dryRun: params.dryRun,
     pollAttempts: params.pollAttempts,
     pollIntervalMs: params.pollIntervalMs,
+    signal: params.signal,
+    timeoutMs: params.timeoutMs,
   });
 }
 
@@ -154,6 +176,8 @@ export async function submitUnfreeze(params: AdminOpParams): Promise<InvokeOutco
     dryRun: params.dryRun,
     pollAttempts: params.pollAttempts,
     pollIntervalMs: params.pollIntervalMs,
+    signal: params.signal,
+    timeoutMs: params.timeoutMs,
   });
 }
 
@@ -171,5 +195,7 @@ export async function submitRotateAgentKey(params: RotateAgentKeyParams): Promis
     dryRun: params.dryRun,
     pollAttempts: params.pollAttempts,
     pollIntervalMs: params.pollIntervalMs,
+    signal: params.signal,
+    timeoutMs: params.timeoutMs,
   });
 }

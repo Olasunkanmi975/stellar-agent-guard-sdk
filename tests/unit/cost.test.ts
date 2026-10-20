@@ -21,9 +21,11 @@ import {
   precheckCost,
   precheckCostWithDecision,
   resourceBreakdownFromSimulation,
+  type CostProvenance,
   type PolicyContext,
   type ResourceBreakdown,
 } from "../../src/cost.ts";
+import { InvalidFeeCeilingError, InvalidInputError } from "../../src/errors.ts";
 import { INCLUSION_FEE } from "../../src/tx.ts";
 import { unsafeContractAddress } from "../../src/policy.ts";
 import type { PreFlightDecision } from "../../src/preflight.ts";
@@ -44,6 +46,7 @@ function admissible(
   resourceFee: bigint,
   footprintKeys = 3,
   resourceBreakdown?: ResourceBreakdown,
+  provenance?: CostProvenance,
 ): PreFlightDecision {
   return {
     allowed: true,
@@ -51,6 +54,7 @@ function admissible(
     estimatedResourceFee: resourceFee,
     footprintKeys,
     ...(resourceBreakdown ? { resourceBreakdown } : {}),
+    ...(provenance ? { provenance } : {}),
   };
 }
 
@@ -153,6 +157,110 @@ describe("exceedsCeiling", () => {
   it("flags a total strictly over the ceiling", () => {
     assert.equal(exceedsCeiling(1_101n, 1_100n), true);
   });
+
+  it("rejects a malformed ceiling instead of letting a comparison decide", () => {
+    for (const bad of [-1n, 100, "100", 1.5]) {
+      assert.throws(
+        () => exceedsCeiling(1n, bad as unknown as bigint),
+        InvalidFeeCeilingError,
+        `expected ${String(bad)} to be refused`,
+      );
+    }
+  });
+});
+
+describe("CostPreChecker fee ceiling validation (#345)", () => {
+  it("rejects a negative configured ceiling at construction", () => {
+    assert.throws(
+      () =>
+        new CostPreChecker({
+          interceptor: fakeInterceptor(admissible(1n)),
+          maxFeeStroops: -1n,
+        }),
+      (err: unknown) => {
+        assert(err instanceof InvalidFeeCeilingError);
+        assert(err instanceof InvalidInputError);
+        assert(err instanceof TypeError);
+        assert.equal(err.field, "maxFeeStroops");
+        assert.equal(err.rule, "non_negative_bigint");
+        assert.equal(err.value, -1n);
+        return true;
+      },
+    );
+  });
+
+  it("rejects non-bigint configured ceilings, including numbers and strings", () => {
+    for (const bad of [0, "0", null, 1.5]) {
+      assert.throws(
+        () =>
+          new CostPreChecker({
+            interceptor: fakeInterceptor(admissible(1n)),
+            maxFeeStroops: bad as unknown as bigint,
+          }),
+        InvalidFeeCeilingError,
+        `expected ${String(bad)} to be refused`,
+      );
+    }
+  });
+
+  it("rejects an invalid per-call ceiling before the interceptor runs", async () => {
+    let calls = 0;
+    const checker = new CostPreChecker({
+      interceptor: {
+        check: async () => {
+          calls += 1;
+          return admissible(1n);
+        },
+      },
+    });
+
+    await assert.rejects(
+      checker.check(CALL, { maxFeeStroops: -5n }),
+      InvalidFeeCeilingError,
+    );
+    assert.equal(calls, 0, "a malformed budget must not spend an RPC");
+  });
+
+  it("treats 0n as a real ceiling, distinct from omission", async () => {
+    const checker = new CostPreChecker({
+      interceptor: fakeInterceptor(admissible(0n)),
+      maxFeeStroops: 0n,
+    });
+    const decision = await checker.check(CALL);
+    assert.equal(decision.kind, "over_budget");
+    assert.equal(decision.feeCeilingStroops, 0n);
+  });
+
+  it("keeps a 0n per-call ceiling distinct from the configured ceiling", async () => {
+    const checker = new CostPreChecker({
+      interceptor: fakeInterceptor(admissible(0n)),
+      maxFeeStroops: 1_000_000n,
+    });
+    const decision = await checker.check(CALL, { maxFeeStroops: 0n });
+    assert.equal(decision.kind, "over_budget");
+    assert.equal(decision.feeCeilingStroops, 0n);
+  });
+
+  it("accepts a large valid ceiling without routing it through Number", async () => {
+    const hugeCeiling = 9_007_199_254_740_993n;
+    const checker = new CostPreChecker({
+      interceptor: fakeInterceptor(admissible(2_000n)),
+      maxFeeStroops: hugeCeiling,
+    });
+    const decision = await checker.check(CALL);
+    assert.equal(decision.kind, "within_budget");
+    assert.equal(decision.feeCeilingStroops, hugeCeiling);
+  });
+
+  it("lets an omitted per-call ceiling fall back to the configured one", async () => {
+    const checker = new CostPreChecker({
+      interceptor: fakeInterceptor(admissible(5_000n)),
+      maxFeeStroops: 1_000n,
+    });
+    const decision = await checker.check(CALL);
+    assert.equal(decision.kind, "over_budget");
+    assert.equal(decision.feeCeilingStroops, 1_000n);
+  });
 });
 
 describe("CostPreChecker", () => {
@@ -181,6 +289,42 @@ describe("CostPreChecker", () => {
 
     assert.equal(decision.kind, "within_budget");
     assert.deepEqual(decision.breakdown, breakdown);
+  });
+
+  it("carries the simulated ledger as provenance and serializes it (#347)", async () => {
+    const checker = new CostPreChecker({
+      interceptor: fakeInterceptor(admissible(2_000n, 3, undefined, { ledger: 512_345 })),
+    });
+    const decision = await checker.check(CALL);
+
+    assert.equal(decision.kind, "within_budget");
+    assert.deepEqual(decision.provenance, { ledger: 512_345 });
+    assert.deepEqual(JSON.parse(JSON.stringify(decision.provenance)), { ledger: 512_345 });
+  });
+
+  it("reports null provenance when the simulation did not establish a ledger", async () => {
+    const checker = new CostPreChecker({ interceptor: fakeInterceptor(admissible(2_000n)) });
+    const decision = await checker.check(CALL);
+    assert.equal(decision.provenance, null);
+  });
+
+  it("reports null provenance for blocked and undetermined decisions", async () => {
+    const blocked = new CostPreChecker({
+      interceptor: fakeInterceptor({
+        allowed: false,
+        kind: "blocked",
+        reason: "per_tx_cap_exceeded",
+        explanation: "over the cap",
+        detail: "simulation failed",
+        diagnosticEvents: [],
+      }),
+    });
+    const undetermined = new CostPreChecker({
+      interceptor: fakeInterceptor({ allowed: false, kind: "undetermined", detail: "trap" }),
+    });
+
+    assert.equal((await blocked.check(CALL)).provenance, null);
+    assert.equal((await undetermined.check(CALL)).provenance, null);
   });
 
   it("reports a call above the ceiling as over budget, keeping the price", async () => {
@@ -300,7 +444,24 @@ describe("formatFee", () => {
     assert.equal(formatFee("1"), "0.0000001");
     assert.equal(formatFee("100"), "0.00001");
     assert.equal(formatFee("1000000000000000000000"), "100000000000000");
-    assert.equal(formatFee("-1"), "-0.0000001");
+  });
+
+  it("refuses negative fees instead of rendering an impossible amount (#346)", () => {
+    assert.throws(
+      () => formatFee(-1n),
+      (err: unknown) => {
+        assert(err instanceof TypeError);
+        assert.match(err.message, /non-negative/);
+        return true;
+      },
+    );
+    assert.throws(() => formatFee("-1"), TypeError);
+    assert.throws(() => formatFee("-10000000"), TypeError);
+  });
+
+  it("accepts zero from both input types as a non-negative fee", () => {
+    assert.equal(formatFee(0n), "0");
+    assert.equal(formatFee("0"), "0");
   });
 
   it("refuses inputs that would have to be coerced", () => {
@@ -334,14 +495,13 @@ describe("formatFee", () => {
       9_999_999n,
       10_000_000n,
       123_456_789_012_345_678n,
-      -42n,
     ]) {
       const rendered = formatFee(stroops);
-      const [whole = "", fraction = ""] = rendered.replace("-", "").split(".");
+      const [whole = "", fraction = ""] = rendered.split(".");
       const back =
         BigInt(whole) * STROOPS_PER_XLM +
         (fraction === "" ? 0n : BigInt(fraction.padEnd(7, "0")));
-      assert.equal(rendered.startsWith("-") ? -back : back, stroops, `round-trip of ${stroops}`);
+      assert.equal(back, stroops, `round-trip of ${stroops}`);
     }
   });
 });

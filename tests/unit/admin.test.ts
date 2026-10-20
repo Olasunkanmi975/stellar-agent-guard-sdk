@@ -23,7 +23,14 @@ import {
   submitSetPolicy,
   submitUnfreeze,
 } from "../../src/admin.ts";
-import { policyToScVal, type PolicyConfig, unsafeContractAddress, unsafeAccountAddress } from "../../src/policy.ts";
+import {
+  policyToScVal,
+  type ContractAddress,
+  type PolicyConfig,
+  unsafeContractAddress,
+  unsafeAccountAddress,
+} from "../../src/policy.ts";
+import { RpcTimeoutError } from "../../src/invoke.ts";
 import type { AdminSigner } from "../../src/tx.ts";
 
 const GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
@@ -255,5 +262,124 @@ describe("typed admin submit functions with custom AdminSigner (e.g. Freighter)"
 
     assert.equal(outcome.kind, "allowed");
     assert.equal(signedTxHookCalled, true);
+  });
+});
+
+/**
+ * Cancellation and per-call timeouts, forwarded to `invoke()` unchanged.
+ *
+ * An operator applying or freezing a policy needs the same bounded RPC
+ * behaviour a normal invocation has, without dropping to the raw `invoke()`
+ * call. The forwarding must be exact: an already-aborted signal must produce
+ * the documented typed outcome (the `error` arm carrying an `RpcTimeoutError`)
+ * *before any RPC*, and a fired timeout must be reported the same way.
+ */
+describe("admin helpers forward signal and timeoutMs", () => {
+  const adminKp = Keypair.random();
+
+  /** A server that fails the test if it is ever called. */
+  function forbiddenServer(calls: string[]) {
+    const forbidden = (name: string) => async () => {
+      calls.push(name);
+      throw new Error(`the RPC must not be reached: ${name}`);
+    };
+    return {
+      getAccount: forbidden("getAccount"),
+      getLatestLedger: forbidden("getLatestLedger"),
+      simulateTransaction: forbidden("simulateTransaction"),
+      sendTransaction: forbidden("sendTransaction"),
+      getTransaction: forbidden("getTransaction"),
+    } as unknown as never;
+  }
+
+  const helpers: Array<{
+    name: string;
+    run: (params: {
+      server: never;
+      guard: ContractAddress;
+      admin: Keypair;
+      signal: AbortSignal;
+    }) => Promise<{
+      kind: string;
+      error?: unknown;
+    }>;
+  }> = [
+    {
+      name: "submitSetPolicy",
+      run: (params) =>
+        submitSetPolicy({ ...params, policy: TEST_POLICY }) as Promise<{
+          kind: string;
+          error?: unknown;
+        }>,
+    },
+    { name: "submitFreeze", run: (params) => submitFreeze(params) as Promise<{ kind: string }> },
+    { name: "submitUnfreeze", run: (params) => submitUnfreeze(params) as Promise<{ kind: string }> },
+    {
+      name: "submitRotateAgentKey",
+      run: (params) =>
+        submitRotateAgentKey({ ...params, newAgent: Keypair.random().publicKey() }) as Promise<{
+          kind: string;
+        }>,
+    },
+  ];
+
+  for (const helper of helpers) {
+    it(`${helper.name} returns the typed abort outcome without any RPC call`, async () => {
+      const controller = new AbortController();
+      controller.abort();
+      const calls: string[] = [];
+
+      const outcome = await helper.run({
+        server: forbiddenServer(calls),
+        guard: GUARD,
+        admin: adminKp,
+        signal: controller.signal,
+      });
+
+      assert.equal(outcome.kind, "error");
+      assert.ok(outcome.error instanceof RpcTimeoutError);
+      assert.equal(outcome.error.aborted, true);
+      assert.deepEqual(calls, [], "an aborted signal must stop the pipeline before any RPC");
+    });
+  }
+
+  it("reports a fired per-call timeout as the same typed timeout outcome", async () => {
+    const never = () => new Promise<never>(() => {});
+    const server = {
+      getAccount: never,
+      getLatestLedger: never,
+      simulateTransaction: never,
+      sendTransaction: never,
+      getTransaction: never,
+    } as unknown as never;
+
+    const outcome = await submitFreeze({
+      server,
+      guard: GUARD,
+      admin: adminKp,
+      timeoutMs: 5,
+    });
+
+    assert.equal(outcome.kind, "error");
+    assert.ok(outcome.error instanceof RpcTimeoutError);
+    assert.equal(outcome.error.aborted, false);
+    assert.equal(outcome.error.timeoutMs, 5);
+  });
+
+  it("leaves the administrative authorization behaviour untouched", async () => {
+    const controller = new AbortController();
+    const mockServer = createMockServer(adminKp.publicKey());
+
+    const outcome = await submitFreeze({
+      server: mockServer as never,
+      guard: GUARD,
+      admin: adminKp,
+      pollIntervalMs: 1,
+      signal: controller.signal,
+      timeoutMs: 30_000,
+    });
+
+    assert.equal(outcome.kind, "allowed");
+    assert.equal(outcome.kind === "allowed" ? outcome.submission.hash : undefined, "admin_tx_hash_123");
   });
 });

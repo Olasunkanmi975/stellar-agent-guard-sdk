@@ -59,6 +59,19 @@ export interface VendoredArtifact {
   outputPath: string;
   /** Has the upstream artifact's own issue landed? (contracts #61: no, yet.) */
   upstreamLanded: boolean;
+  /**
+   * Key the vendored content is stored under in the output document.
+   *
+   * Defaults to `schema`, the key the policy schema has always used. A second
+   * vendored artifact picks its own key so the two never share a namespace.
+   */
+  contentKey?: string;
+  /** The upstream issue this artifact tracks. */
+  upstreamIssue?: string;
+  /** Note recorded in the provenance header, describing the vendoring state. */
+  note?: string;
+  /** ISO timestamp recorded as the last refresh of this artifact. */
+  updatedAt?: string;
 }
 
 /**
@@ -79,8 +92,32 @@ const POLICY_SCHEMA: VendoredArtifact = {
   upstreamLanded: false,
 };
 
+/**
+ * The canonical `auth_checked` vocabulary of the guard contract.
+ *
+ * The contracts repo owns the allowed path, every `Error` code and reason
+ * symbol, the exact event topics and the data-map fields of the decision
+ * event (contracts PR #280, issue #42). This SDK consumes that file as the
+ * source of truth in its decoder tests instead of keeping a second copy of
+ * the matrix here — a copy is a copy, and a copy drifts.
+ */
+const AUTH_CHECKED_VOCABULARY: VendoredArtifact = {
+  sourceRepo: "Stellar-Agent-Guard/stellar-agent-guard-contracts",
+  repoCommit: "c921063bbc90f608cbf0721e0fbb72e6183f9264",
+  sourcePath: "tests/fixtures/auth-checked-vocabulary.json",
+  outputPath: "tests/fixtures/vendor/auth-checked-vocabulary.json",
+  upstreamLanded: true,
+  contentKey: "vocabulary",
+  upstreamIssue: "Stellar-Agent-Guard/stellar-agent-guard-contracts#42",
+  note: "vendored copy of the landed upstream file; the SDK's decoder tests read it as the source of truth for the decision vocabulary",
+  updatedAt: "2026-10-20T00:00:00.000Z",
+};
+
 /** Every registered feed. Add new vendored artifacts here. */
-export const VENDORED_ARTIFACTS: readonly VendoredArtifact[] = [POLICY_SCHEMA];
+export const VENDORED_ARTIFACTS: readonly VendoredArtifact[] = [
+  POLICY_SCHEMA,
+  AUTH_CHECKED_VOCABULARY,
+];
 
 export interface VendorReport {
   artifact: VendoredArtifact;
@@ -94,22 +131,26 @@ export interface VendorReport {
 
 /** Stable, byte-exact provenance header for a vendored artifact. */
 export function provenanceHeader(artifact: VendoredArtifact, digest: string): Record<string, unknown> {
+  const contentKey = artifact.contentKey ?? "schema";
   return {
     _provenance: {
       sourceRepo: artifact.sourceRepo,
       sourceCommit: artifact.repoCommit,
       sourcePath: artifact.sourcePath,
       digest: `sha256:${digest}`,
-      digestAlgorithm: "sha256 over the vendored schema bytes (the `schema` value re-serialized)",
+      digestAlgorithm: `sha256 over the vendored content bytes (the \`${contentKey}\` value re-serialized)`,
       refreshCommand: "npm run vendor:refresh",
       refreshProtocol:
-        "bump scripts/vendor-fixtures.ts POLICY_SCHEMA.repoCommit to the pinned upstream SHA, then rerun; commit artifact + digest together",
+        "bump scripts/vendor-fixtures.ts <artifact>.repoCommit to the pinned upstream SHA, then rerun; commit artifact + digest together",
       upstreamLanded: artifact.upstreamLanded,
-      upstreamIssue: "Stellar-Agent-Guard/stellar-agent-guard-contracts#61",
-      note: artifact.upstreamLanded
-        ? "vendored copy of the landed upstream file; refresh protocol applies on every upstream schema change"
-        : "vendored ahead of upstream: written from contracts SPEC §8 pending issue #61; refresh protocol re-fetches the landed file once it exists",
-      updatedAt: "2026-09-30T00:00:00.000Z",
+      upstreamIssue:
+        artifact.upstreamIssue ?? "Stellar-Agent-Guard/stellar-agent-guard-contracts#61",
+      note:
+        artifact.note ??
+        (artifact.upstreamLanded
+          ? "vendored copy of the landed upstream file; refresh protocol applies on every upstream schema change"
+          : "vendored ahead of upstream: written from contracts SPEC §8 pending issue #61; refresh protocol re-fetches the landed file once it exists"),
+      updatedAt: artifact.updatedAt ?? "2026-09-30T00:00:00.000Z",
     },
   };
 }
@@ -171,7 +212,8 @@ export function refreshArtifact(
   if (!options.dryRun && !unchanged) {
     mkdirSync(dirname(destination), { recursive: true });
     const parsed = JSON.parse(rawContent) as Record<string, unknown>;
-    const document = { ...provenanceHeader(artifact, digest), schema: parsed };
+    const contentKey = artifact.contentKey ?? "schema";
+    const document = { ...provenanceHeader(artifact, digest), [contentKey]: parsed };
     writeFileSync(destination, `${JSON.stringify(document, null, 2)}\n`, "utf8");
   }
   return { artifact, bytes: Buffer.byteLength(canonical, "utf8"), digest, unchanged };

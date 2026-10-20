@@ -8,6 +8,12 @@
  * topic (`event_auth_checked` → `blocked, <reason>`). Off-chain code and on-chain
  * code therefore share one vocabulary, which is why this table is duplicated
  * rather than inferred.
+ *
+ * The table is checked against the contracts repo's own vocabulary fixture —
+ * `tests/fixtures/vendor/auth-checked-vocabulary.json`, vendored from
+ * `stellar-agent-guard-contracts/tests/fixtures/auth-checked-vocabulary.json` —
+ * so a reason the contract adds is a failing test here until this table is
+ * extended, rather than a symbol the SDK silently mislabels.
  */
 import { GuardError } from "./errors.ts";
 
@@ -17,6 +23,7 @@ export const GUARD_REASON_CODES = {
   not_initialized: 3,
   invalid_config: 4,
   invalid_amount: 5,
+  no_pending_admin: 6,
   admin_frozen: 10,
   heartbeat_expired: 11,
   no_policy: 12,
@@ -31,6 +38,11 @@ export const GUARD_REASON_CODES = {
   unknown_contract: 26,
   self_function_not_allowed: 27,
   create_contract_not_allowed: 28,
+  recipient_blocked: 29,
+  protocol_call_rate_exceeded: 30,
+  decision_invariant_violation: 31,
+  asset_fn_not_allowed: 32,
+  too_many_auth_contexts: 33,
 } as const;
 
 /**
@@ -169,6 +181,11 @@ export const reasonMessagesEn: Readonly<Record<GuardReason, ReasonMessageText>> 
     body: "The transfer amount was zero or negative.",
     remediation: "Send a positive transfer amount.",
   },
+  no_pending_admin: {
+    title: "No pending admin rotation",
+    body: "The account has no pending admin rotation to confirm or cancel.",
+    remediation: "Start an admin rotation first, then confirm or cancel it.",
+  },
   admin_frozen: {
     title: "Account frozen",
     body: "An admin froze the account (freeze), or the dead-man switch grace window lapsed.",
@@ -238,6 +255,31 @@ export const reasonMessagesEn: Readonly<Record<GuardReason, ReasonMessageText>> 
     title: "Contract creation not permitted",
     body: "The account may not authorize contract creation.",
     remediation: "Create the contract from an admin account instead of the guarded account.",
+  },
+  recipient_blocked: {
+    title: "Recipient blocked",
+    body: "The transfer recipient is explicitly blocked by the account's policy.",
+    remediation: "Send to a different recipient, or remove the block if it is no longer wanted.",
+  },
+  protocol_call_rate_exceeded: {
+    title: "Protocol call rate exceeded",
+    body: "The call would push the rolling protocol-call count past its configured limit.",
+    remediation: "Wait for the rolling window to free capacity, or make fewer protocol calls.",
+  },
+  decision_invariant_violation: {
+    title: "Decision invariant violation",
+    body: "The guard's decision engine hit an internal invariant, so the call was refused rather than allowed.",
+    remediation: "Treat this as a guard defect: capture the call and report it to the contract maintainers.",
+  },
+  asset_fn_not_allowed: {
+    title: "Asset function not permitted",
+    body: "The call invoked a function other than `transfer` on an allowlisted asset.",
+    remediation: "Call `transfer`, or allowlist the asset's function explicitly.",
+  },
+  too_many_auth_contexts: {
+    title: "Too many authorization contexts",
+    body: "The call carried more authorization contexts than the guard's decision engine evaluates.",
+    remediation: "Split the call so each authorization carries fewer contexts.",
   },
 });
 

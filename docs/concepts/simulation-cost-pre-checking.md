@@ -17,4 +17,6 @@ read-only/read-write/total storage-footprint entry counts. The breakdown is
 omitted when the simulation does not provide a complete resource block; it is
 never replaced with fabricated zeroes.
 
-If an operator specifies `maxFeeStroops`, calls exceeding the limit return `over_budget`. Blocked calls are reported as `blocked` with an explicitly zero fee.
+If an operator specifies `maxFeeStroops`, calls exceeding the limit return `over_budget`. The ceiling must be a non-negative `bigint`; a negative or non-`bigint` value is rejected with `InvalidFeeCeilingError` before any simulation, and `0n` is a real ceiling rather than the same as omitting it. Blocked calls are reported as `blocked` with an explicitly zero fee.
+
+Priced decisions also carry `provenance: { ledger } | null`, copied from the same enforced simulation response that produced the fee. It identifies the ledger snapshot a quote describes; it is informational and not a promise of where the transaction will land. When the simulation response has no usable ledger marker, provenance is `null` instead of a fabricated number.

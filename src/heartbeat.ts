@@ -21,7 +21,12 @@
 import { Keypair, rpc } from "@stellar/stellar-sdk";
 import { DEFAULT_NETWORK_PASSPHRASE } from "./admin.ts";
 import { BroadcastError, GuardError, SimulationError } from "./errors.ts";
-import { invoke, RpcTimeoutError, type InvokeOutcome } from "./invoke.ts";
+import {
+  invoke,
+  RpcTimeoutError,
+  type InvokeDryRunVerdict,
+  type InvokeOutcome,
+} from "./invoke.ts";
 import { unsafeContractAddress, type PolicyConfig } from "./policy.ts";
 import { explainReason, GuardBlockedError } from "./reasons.ts";
 import type { AgentSigner, AdminSigner } from "./tx.ts";
@@ -102,6 +107,47 @@ export class HeartbeatBlockedError extends GuardError {
 }
 
 /**
+ * The submission ran as a dry run, so no heartbeat reached the guard.
+ *
+ * A dry-run outcome is not a policy refusal and not a transport failure: the
+ * pipeline priced and simulated the call but stopped before broadcast. The
+ * dead-man switch is therefore untouched, and the scheduler reports this typed
+ * error through `onError` instead of counting the beat (issue #292). It is
+ * never retried as a backoff attempt — a dry run is a submission configuration,
+ * not a transient fault — while the normal cadence keeps trying the next beat.
+ */
+export class HeartbeatDryRunError extends GuardError {
+  /** The outcome discriminator a caller can branch on. */
+  readonly kind = "dry_run" as const;
+  /** The dry run's policy verdict, when it reached one. */
+  readonly verdict: InvokeDryRunVerdict;
+  /** The contract's refusal reason, when the dry run reported one. */
+  readonly reason: string | null;
+  /** The pipeline's detail line, when it carried one. */
+  readonly detail: string | null;
+
+  constructor(params: {
+    verdict: InvokeDryRunVerdict;
+    reason: string | null;
+    detail: string | null;
+  }) {
+    const explanation = params.reason
+      ? explainReason(params.reason)
+      : `dry run verdict: ${params.verdict}`;
+    super(
+      `stellar-agent-guard heartbeat ran as a dry run and never reached the guard ` +
+        `(verdict: ${params.verdict}${params.reason ? `, reason: ${params.reason}` : ""}): ` +
+        explanation +
+        (params.detail ? `\n${params.detail}` : ""),
+    );
+    this.name = "HeartbeatDryRunError";
+    this.verdict = params.verdict;
+    this.reason = params.reason;
+    this.detail = params.detail;
+  }
+}
+
+/**
  * True when a heartbeat submission failure is worth retrying (issue #340).
  *
  * Only a *transport* failure qualifies: the RPC was unreachable, the request
@@ -114,12 +160,15 @@ export class HeartbeatBlockedError extends GuardError {
  * - a **policy block** (`GuardBlockedError`, `HeartbeatBlockedError`, or a
  *   blocked `invoke` outcome): the guard made a decision, and hammering a call
  *   it has already refused only adds load;
+ * - a **dry run** (`HeartbeatDryRunError`): the submission never reached the
+ *   guard, and re-sending the same dry-run configuration cannot fix that;
  * - anything the SDK cannot classify: an unknown error is reported, not
  *   retried, because retrying a deterministic failure is just load.
  */
 export function isRetryableHeartbeatFailure(error: unknown): boolean {
   if (error instanceof GuardBlockedError) return false;
   if (error instanceof HeartbeatBlockedError) return false;
+  if (error instanceof HeartbeatDryRunError) return false;
   if (error instanceof BroadcastError) return true;
   if (error instanceof RpcTimeoutError) return true;
   if (error instanceof SimulationError) return true;
@@ -604,13 +653,86 @@ type BeatSubmissionResult =
   | { ok: false; attempt: number; error: unknown };
 
 /**
- * Run one submission attempt and classify what came back (issue #340).
+ * The classification of one resolved submission outcome (issue #292).
+ *
+ * Only an `allowed` outcome — a heartbeat the guard actually accepted — is a
+ * beat. Everything else is reported, never counted: a refusal is a decision, a
+ * pipeline error is a failure, and a dry run never reaches the guard at all.
+ * The `kind` tells the caller (and the retry policy) which of those it is.
+ */
+type HeartbeatOutcomeClassification =
+  | { kind: "allowed" }
+  | { kind: "blocked"; error: HeartbeatBlockedError; retryable: false }
+  | { kind: "error"; error: unknown; retryable: boolean }
+  | { kind: "dry_run"; error: HeartbeatDryRunError; retryable: false }
+  | { kind: "unclassified"; error: GuardError; retryable: false };
+
+/**
+ * Classify a resolved `invoke()` outcome explicitly (issue #292).
+ *
+ * `invoke()` is result-oriented: a refusal (`blocked`), a pipeline failure
+ * (`error`) and a dry run (`dry_run`) all resolve normally. Treating any
+ * resolved promise as a beat therefore let a live agent freeze while the
+ * scheduler reported success and suppressed the same-second retry. The switch
+ * is exhaustive over the outcome arms so a new arm fails closed here instead of
+ * being silently counted as an accepted beat.
+ */
+function classifyHeartbeatOutcome(outcome: InvokeOutcome): HeartbeatOutcomeClassification {
+  switch (outcome.kind) {
+    case "allowed":
+      return { kind: "allowed" };
+    case "blocked":
+      // The guard refused the heartbeat. A refusal is a decision: it is
+      // reported and never retried as a backoff attempt.
+      return {
+        kind: "blocked",
+        error: new HeartbeatBlockedError({ reason: outcome.reason, detail: outcome.detail }),
+        retryable: false,
+      };
+    case "error":
+      // A pipeline failure. The typed error says whether it was a transport
+      // problem (retryable) or something the SDK cannot classify.
+      return {
+        kind: "error",
+        error: outcome.error,
+        retryable: isRetryableHeartbeatFailure(outcome.error),
+      };
+    case "dry_run":
+      // The pipeline stopped before broadcast, so nothing reached the guard.
+      return {
+        kind: "dry_run",
+        error: new HeartbeatDryRunError({
+          verdict: outcome.verdict,
+          reason: outcome.reason,
+          detail: outcome.detail,
+        }),
+        retryable: false,
+      };
+    default: {
+      // Unreachable for the current union. Kept as a runtime fail-closed arm:
+      // an outcome shape this SDK does not understand is reported, never
+      // counted as a beat.
+      const unexpected = outcome as { kind?: unknown };
+      return {
+        kind: "unclassified",
+        error: new GuardError(
+          `stellar-agent-guard heartbeat returned an unrecognized outcome kind ` +
+            `(${String(unexpected.kind)}); no heartbeat is counted`,
+        ),
+        retryable: false,
+      };
+    }
+  }
+}
+
+/**
+ * Run one submission attempt and classify what came back (issues #292, #340).
  *
  * A heartbeat can fail in two shapes: the submission throws, or it *resolves*
- * with an outcome that is not a success — `invoke()` reports a policy block
- * and a pipeline failure as outcomes, not as throws. Both are failures here,
- * because a heartbeat that was refused or that never reached the ledger does
- * not keep the dead-man switch alive.
+ * with an outcome that is not an allowed submission — `invoke()` reports a
+ * policy block, a pipeline failure and a dry run as outcomes, not as throws.
+ * Only an `allowed` outcome counts as a beat; every other resolved outcome is
+ * returned as a failure so it never advances `lastBeatAt`/`lastBeatSecond`.
  */
 async function attemptSubmission(
   submit: (beat: HeartbeatBeat, context: HeartbeatSubmitContext) => Promise<HeartbeatSubmission | void>,
@@ -625,23 +747,15 @@ async function attemptSubmission(
   }
 
   const outcome = submission?.outcome;
+  // A custom `submit` that omits the outcome opts out of outcome
+  // classification: its resolved promise is the only evidence available, so it
+  // is treated as an accepted beat. The default submission always reports an
+  // outcome, which is why the classification below is the path that matters.
   if (outcome === undefined) return { ok: true, submission };
-  if (outcome.kind === "blocked") {
-    // The guard refused the heartbeat. A refusal is a decision: it is reported
-    // and never retried.
-    return {
-      ok: false,
-      error: new HeartbeatBlockedError({ reason: outcome.reason, detail: outcome.detail }),
-      retryable: false,
-    };
-  }
-  if (outcome.kind === "error") {
-    // A pipeline failure. The typed error says whether it was a transport
-    // problem (retryable) or something the SDK cannot classify.
-    const error = outcome.error;
-    return { ok: false, error, retryable: isRetryableHeartbeatFailure(error) };
-  }
-  return { ok: true, submission };
+
+  const classification = classifyHeartbeatOutcome(outcome);
+  if (classification.kind === "allowed") return { ok: true, submission };
+  return { ok: false, error: classification.error, retryable: classification.retryable };
 }
 
 /**
@@ -663,6 +777,12 @@ async function attemptSubmission(
  * `missedBeats` and is reported through `onBeat`'s `lateMs`; every cadence slot
  * skipped while a submission was in flight is counted too. A submission
  * failure goes to `onError` and never escapes as an unhandled rejection.
+ *
+ * Only an `allowed` outcome advances `lastBeatAt` and the same-second dedupe
+ * marker. A `blocked` outcome is reported as a typed `HeartbeatBlockedError`,
+ * an `error` outcome as its typed pipeline error, and a `dry_run` outcome as a
+ * `HeartbeatDryRunError`; none of them counts as a beat, so the next cadence
+ * tries again instead of suppressing the retry (issue #292).
  *
  * ## Stopping
  *

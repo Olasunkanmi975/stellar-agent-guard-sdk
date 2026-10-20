@@ -3,9 +3,11 @@
  *
  * Callers should branch on an error class (or on the class attached to a result-
  * oriented `invoke` error outcome), not by matching human-readable messages that
- * may change as the Stellar SDK evolves. Every SDK-owned error extends
- * `GuardError`, so a single `instanceof GuardError` check remains sufficient for
- * integrations that do not need a finer category.
+ * may change as the Stellar SDK evolves. Operational SDK errors extend
+ * `GuardError`, so a single `instanceof GuardError` check covers transport,
+ * signing, policy and simulation failures. Invalid caller input is the deliberate
+ * exception: `InvalidInputError` extends `TypeError` so a malformed argument is
+ * distinguishable from an operational failure.
  */
 import type { InvokeRetryMetadata } from "./retry.ts";
 
@@ -18,6 +20,61 @@ export class GuardError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
     this.name = new.target.name;
+  }
+}
+
+/**
+ * A caller-supplied value had the wrong shape or type.
+ *
+ * This is an `InputError` in the platform sense: it is thrown before the SDK
+ * does any work with the value, so a caller can distinguish a programmer error
+ * from a policy verdict or a transport failure. Extending `TypeError` keeps the
+ * conventional `instanceof TypeError` check working for invalid inputs.
+ */
+export class InvalidInputError extends TypeError {
+  /** The input field that failed validation. */
+  readonly field: string;
+  /** Stable rule identifier for the failed check. */
+  readonly rule: string;
+  /** Optional human-readable detail with the offending value. */
+  readonly detail?: string | undefined;
+
+  constructor(field: string, rule: string, detail?: string) {
+    const message = detail
+      ? `Invalid input for '${field}': violates rule '${rule}' (${detail})`
+      : `Invalid input for '${field}': violates rule '${rule}'`;
+    super(message);
+    this.name = new.target.name;
+    this.field = field;
+    this.rule = rule;
+    if (detail !== undefined) {
+      this.detail = detail;
+    }
+  }
+}
+
+/**
+ * A fee ceiling was not a non-negative `bigint` in stroops.
+ *
+ * Fee ceilings describe a spend policy, not a signed delta: a negative value
+ * would make every real quote appear over budget, and routing a `number` or a
+ * string through would hide the precision loss the SDK deliberately refuses.
+ * Rejected at the configuration boundary (constructor) and again before a
+ * per-call override is used, so neither path can silently become a policy.
+ */
+export class InvalidFeeCeilingError extends InvalidInputError {
+  /** The rejected value, kept for callers that report the bad input. */
+  readonly value: unknown;
+
+  constructor(field: string, value: unknown) {
+    const received =
+      typeof value === "bigint"
+        ? `${value}n`
+        : typeof value === "string"
+          ? JSON.stringify(value)
+          : String(value);
+    super(field, "non_negative_bigint", `expected a non-negative bigint, got ${received}`);
+    this.value = value;
   }
 }
 
@@ -127,11 +184,23 @@ export class BroadcastError extends GuardError {
 
 /** A contract response did not match the API shape the SDK understands. */
 export class ContractResponseError extends GuardError {
+  /** The exact field of the contract response that did not match. */
   readonly field: string;
+  /**
+   * The pipeline stage that read the field, when the failure has one
+   * (`"probe"`, `"simulate"`, `"preflight"`, `"assemble"`).
+   *
+   * Additive: a malformed value is reported with the same typed error
+   * everywhere, and the stage says *where* the bad value was seen — the
+   * distinction a caller needs to tell a bad simulation apart from a bad
+   * policy payload.
+   */
+  readonly stage?: string | undefined;
 
-  constructor(message: string, options: { field: string; cause?: unknown }) {
+  constructor(message: string, options: { field: string; stage?: string; cause?: unknown }) {
     super(message, causeOptions(options.cause));
     this.field = options.field;
+    if (options.stage !== undefined) this.stage = options.stage;
   }
 }
 

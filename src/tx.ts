@@ -86,8 +86,18 @@ export interface ContractCall {
  * or bigint. All three are accepted only when they are an exact non-negative
  * u64. A missing field is invalid, not zero: callers must report the simulation
  * as undetermined rather than make a budget decision from fabricated pricing.
+ *
+ * Every rejection is the same typed `ContractResponseError` naming the exact
+ * field, so a malformed fee is classified like every other malformed contract
+ * response instead of escaping as a native conversion error. `options.stage`
+ * records where the value was read (`"simulate"`, `"preflight"`, `"assemble"`),
+ * so the failure says *which* stage saw the bad value.
  */
-export function parseSimulationResourceFee(raw: unknown): bigint {
+export function parseSimulationResourceFee(
+  raw: unknown,
+  options?: { stage?: string | undefined },
+): bigint {
+  const stage = options?.stage;
   let value: bigint;
   if (typeof raw === "bigint") {
     value = raw;
@@ -98,14 +108,14 @@ export function parseSimulationResourceFee(raw: unknown): bigint {
   } else {
     throw new ContractResponseError(
       `simulation returned an invalid resource fee: ${JSON.stringify(raw)}`,
-      { field: "minResourceFee" },
+      { field: "minResourceFee", ...(stage !== undefined ? { stage } : {}) },
     );
   }
 
   if (value < 0n || value > MAX_RESOURCE_FEE) {
     throw new ContractResponseError(
       `simulation resource fee ${value} is outside the u64 range`,
-      { field: "minResourceFee" },
+      { field: "minResourceFee", ...(stage !== undefined ? { stage } : {}) },
     );
   }
   return value;
@@ -594,7 +604,15 @@ export function assembleFromSimulation(params: {
     footprintKeys = merged.length;
   }
 
-  const minResourceFee = BigInt(simulation.minResourceFee);
+  // The simulation's own price for the transaction, read through the shared
+  // exact-u64 parser. `BigInt(...)` would accept whatever the RPC sent and
+  // throw a native `SyntaxError` on a malformed value; the parser instead
+  // rejects a missing, negative or out-of-range fee with the SDK's typed
+  // `ContractResponseError`, naming the field, so a malformed simulation is
+  // classified like every other malformed contract response.
+  const minResourceFee = parseSimulationResourceFee(simulation.minResourceFee, {
+    stage: "assemble",
+  });
   const extra = params.extraResourceFee ?? 0n;
   data.setResourceFee(minResourceFee + extra);
 
@@ -703,6 +721,55 @@ export interface SubmissionResult {
     diagnosticEvents: unknown[];
   } | null;
   events: unknown[];
+}
+
+/**
+ * What the network said about a submission, reported the moment the RPC
+ * answered — before any status polling.
+ *
+ * The transaction hash is the operator's recovery handle. It is what a support
+ * engineer needs to look the transaction up on an explorer when the SDK's own
+ * polling never finishes, so it is published as soon as it exists rather than
+ * only on the final outcome: a caller that stores it keeps it even when the
+ * subsequent status query fails or the invocation's budget runs out.
+ */
+export interface SubmissionAcceptedEvent {
+  /**
+   * The transaction hash the network assigned, or `null` when the broadcast
+   * response carried none.
+   *
+   * `null` is the **ambiguous** case: the server answered, but the answer
+   * names no transaction, so the SDK cannot poll for it and cannot say where
+   * it went. It is reported rather than hidden, and the submission fails
+   * closed — an untrackable transaction is never reported as submitted.
+   */
+  hash: string | null;
+  /**
+   * The RPC's own status for the submission (`PENDING`, `SUCCESS`, `ERROR`),
+   * or `null` when the response carried none.
+   */
+  status: string | null;
+}
+
+/**
+ * Deliver the submission event to the caller's hook.
+ *
+ * The hook is the caller's, and a throwing hook must never decide whether a
+ * transaction ran — the same rule the `onStep` hook follows. The event is
+ * delivered exactly once, immediately after the network answered and before
+ * any polling, so a caller that records the hash has it even if everything
+ * after the broadcast fails.
+ */
+function notifySubmitted(
+  hook: ((event: SubmissionAcceptedEvent) => void) | undefined,
+  event: SubmissionAcceptedEvent,
+): void {
+  if (!hook) return;
+  try {
+    hook(event);
+  } catch {
+    /* a broken consumer must not break the submission */
+  }
 }
 
 /** Recursively convert SDK XDR values into plain, inspectable objects. */
@@ -887,6 +954,14 @@ export async function submitAndPoll(
     clock?: Clock | undefined;
     /** Absolute clock time at which polling must stop; consumes the same budget. */
     deadlineAt?: number | undefined;
+    /**
+     * Called once with the network's answer, before any status polling.
+     *
+     * This is where the transaction hash becomes available to the caller: it is
+     * the operator's recovery handle, and publishing it here means a caller
+     * keeps it even when the polling that follows fails or runs out of budget.
+     */
+    onSubmitted?: ((event: SubmissionAcceptedEvent) => void) | undefined;
   } = {},
 ): Promise<SubmissionResult> {
   const clock = options.clock ?? systemClock;
@@ -912,15 +987,25 @@ export async function submitAndPoll(
   } catch (error) {
     throw new BroadcastError("transaction submission request failed", { cause: error });
   }
+
+  // The network has answered. Publish what it said — above all the hash —
+  // before anything else can consume the caller's budget, so the caller can
+  // look the transaction up even if the wait below never resolves.
+  const accepted: SubmissionAcceptedEvent = {
+    hash: typeof sent.hash === "string" && sent.hash.length > 0 ? sent.hash : null,
+    status: typeof sent.status === "string" ? sent.status : null,
+  };
+  notifySubmitted(options.onSubmitted, accepted);
+
   // The send may itself have consumed the rest of the budget. Check before
   // interpreting its result, so a success-shaped response cannot outrun the
   // caller's deadline.
   if (options.deadlineAt !== undefined && clock.now() >= options.deadlineAt) {
-    return deadlineExceededResult(sent.hash);
+    return deadlineExceededResult(accepted.hash ?? "");
   }
   if (sent.status === "ERROR") {
     return {
-      hash: sent.hash,
+      hash: accepted.hash ?? "",
       status: sent.status,
       ledger: null,
       failure: {
@@ -933,34 +1018,46 @@ export async function submitAndPoll(
     };
   }
 
+  // An ambiguous broadcast response: the server claimed the transaction but
+  // named no hash. There is nothing to poll for and nothing to report as
+  // submitted, so the submission fails closed with a typed `BroadcastError`
+  // rather than pretending an untrackable transaction is on its way.
+  const hash = accepted.hash;
+  if (hash === null) {
+    throw new BroadcastError(
+      "the network accepted the submission but returned no transaction hash",
+      { transactionHash: null },
+    );
+  }
+
   const attempts = options.pollAttempts ?? 20;
   const interval = options.pollIntervalMs ?? 3_000;
   for (let attempt = 0; attempt < attempts; attempt++) {
     if (options.deadlineAt !== undefined) {
       const remaining = options.deadlineAt - clock.now();
-      if (remaining <= 0) return deadlineExceededResult(sent.hash);
+      if (remaining <= 0) return deadlineExceededResult(hash);
       await clock.sleep(Math.min(interval, remaining));
-      if (clock.now() >= options.deadlineAt) return deadlineExceededResult(sent.hash);
+      if (clock.now() >= options.deadlineAt) return deadlineExceededResult(hash);
     } else {
       await clock.sleep(interval);
     }
     let result: Awaited<ReturnType<rpc.Server["getTransaction"]>>;
     try {
-      result = await server.getTransaction(sent.hash);
+      result = await server.getTransaction(hash);
     } catch (error) {
-      throw new BroadcastError(`could not poll transaction ${sent.hash}`, {
-        transactionHash: sent.hash,
+      throw new BroadcastError(`could not poll transaction ${hash}`, {
+        transactionHash: hash,
         cause: error,
       });
     }
     // A poll that answers at or after the deadline is not an admissible result,
     // even when it says SUCCESS: the caller's budget was already spent.
     if (options.deadlineAt !== undefined && clock.now() >= options.deadlineAt) {
-      return deadlineExceededResult(sent.hash);
+      return deadlineExceededResult(hash);
     }
     if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) {
       return {
-        hash: sent.hash,
+        hash,
         status: result.status,
         ledger: result.ledger ?? null,
         failure: null,
@@ -974,7 +1071,7 @@ export async function submitAndPoll(
         diagnosticEventsXdr?: unknown[];
       };
       return {
-        hash: sent.hash,
+        hash,
         status: result.status,
         ledger: result.ledger ?? null,
         failure: {
@@ -988,7 +1085,7 @@ export async function submitAndPoll(
     }
   }
   return {
-    hash: sent.hash,
+    hash,
     status: "TIMEOUT",
     ledger: null,
     failure: {

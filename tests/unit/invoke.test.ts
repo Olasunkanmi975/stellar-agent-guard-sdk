@@ -23,11 +23,11 @@ import {
   InvokeRetryError,
 } from "../../src/invoke.ts";
 import { BroadcastError } from "../../src/tx.ts";
-import { SimulationError } from "../../src/errors.ts";
+import { ContractResponseError, SimulationError } from "../../src/errors.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
 import { FakeClock, type Clock } from "../../src/clock.ts";
 import { TRACE_STEP_NAMES, type TraceStepName } from "../../src/trace.ts";
-import type { InvokeStepEvent } from "../../src/invoke.ts";
+import type { InvokeStepEvent, SubmissionAcceptedEvent } from "../../src/invoke.ts";
 import { unsafeContractAddress, unsafeAccountAddress } from "../../src/policy.ts";
 
 const GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
@@ -1800,6 +1800,207 @@ describe("invoke() overall deadline", () => {
     assert.equal(outcome.verdict, "undetermined");
     assert.ok(outcome.error instanceof RpcTimeoutError);
     assert.equal(outcome.error.deadline, true);
+    assert.equal(outcome.fees.totalFeeStroops, 0n);
+  });
+});
+
+// ── The transaction hash, published before the confirmation polling ─────────
+
+/**
+ * The transaction hash is the operator's recovery handle after the broadcast.
+ *
+ * These tests pin *when* it becomes available: as soon as the network accepts
+ * the submission, not only when the whole invocation returns. A caller that
+ * has to wait for a long — or exhausted — confirmation poll must still be able
+ * to find the transaction, and must never have to scrape it out of an error
+ * string or a log line.
+ */
+describe("invoke() submission hash", () => {
+  const HASH = "b".repeat(64);
+
+  it("publishes the hash before the confirmation polling starts", async () => {
+    const order: string[] = [];
+    const events: SubmissionAcceptedEvent[] = [];
+    const server = createMockServer({
+      send: () => {
+        order.push("send");
+        return { status: "PENDING", hash: HASH };
+      },
+      getTransaction: (hash) => {
+        order.push(`poll:${hash}`);
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 42 };
+      },
+    });
+
+    const outcome = await invoke(
+      makeParams(server, {
+        pollOptions: { pollAttempts: 1, pollIntervalMs: 0 },
+        onSubmitted: (event) => {
+          order.push("submitted");
+          events.push(event);
+        },
+      }),
+    );
+
+    assert.equal(outcome.kind, "allowed");
+    assert.deepEqual(events, [{ hash: HASH, status: "PENDING" }]);
+    assert.deepEqual(order, ["send", "submitted", `poll:${HASH}`]);
+  });
+
+  it("keeps the hash when the status poll fails after the broadcast", async () => {
+    const events: SubmissionAcceptedEvent[] = [];
+    const server = createMockServer({
+      send: () => ({ status: "PENDING", hash: HASH }),
+      getTransaction: () => {
+        throw new Error("rpc unavailable");
+      },
+    });
+
+    const outcome = await invoke(
+      makeParams(server, {
+        pollOptions: { pollAttempts: 1, pollIntervalMs: 0 },
+        onSubmitted: (event) => events.push(event),
+      }),
+    );
+
+    assert.equal(outcome.kind, "error");
+    assert.ok(outcome.error instanceof BroadcastError);
+    // The recovery handle survives the failed poll: both on the event and on
+    // the outcome, so a caller never has to parse it out of the error text.
+    assert.deepEqual(events, [{ hash: HASH, status: "PENDING" }]);
+    assert.equal(outcome.transactionHash, HASH);
+    assert.equal(outcome.error.transactionHash, HASH);
+  });
+
+  it("keeps the hash when the overall deadline stops the confirmation polling", async () => {
+    let now = 0;
+    const clock: Clock = {
+      now: () => now,
+      sleep: async (delayMs) => {
+        now += delayMs;
+      },
+    };
+    const events: SubmissionAcceptedEvent[] = [];
+    const server = createMockServer({
+      send: () => ({ status: "PENDING", hash: HASH }),
+      getTransaction: () => ({ status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 42 }),
+    });
+
+    const outcome = await invoke(
+      makeParams(server, {
+        deadlineMs: VIRTUAL_DEADLINE_MS,
+        clock,
+        pollOptions: { pollAttempts: 5, pollIntervalMs: VIRTUAL_DEADLINE_MS * 2 },
+        onSubmitted: (event) => events.push(event),
+      }),
+    );
+
+    const error = expectDeadlineError(outcome);
+    assert.equal(error.stage, "poll");
+    assert.deepEqual(events, [{ hash: HASH, status: "PENDING" }]);
+    assert.equal(outcome.kind === "error" ? outcome.transactionHash : undefined, HASH);
+  });
+
+  it("fails closed when the broadcast response names no transaction", async () => {
+    const events: SubmissionAcceptedEvent[] = [];
+    let polls = 0;
+    const server = createMockServer({
+      send: () => ({ status: "PENDING", hash: "" }),
+      getTransaction: () => {
+        polls += 1;
+        return { status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 42 };
+      },
+    });
+
+    const outcome = await invoke(
+      makeParams(server, {
+        pollOptions: { pollAttempts: 1, pollIntervalMs: 0 },
+        onSubmitted: (event) => events.push(event),
+      }),
+    );
+
+    assert.equal(outcome.kind, "error");
+    assert.ok(outcome.error instanceof BroadcastError);
+    assert.equal(outcome.error.transactionHash, null);
+    // The ambiguity is reported, not hidden: the caller learns that the
+    // submission was accepted but cannot be tracked.
+    assert.deepEqual(events, [{ hash: null, status: "PENDING" }]);
+    assert.equal(polls, 0, "an untrackable transaction must not be polled for");
+  });
+
+  it("changes nothing when no hook is supplied", async () => {
+    const server = createMockServer({
+      send: () => ({ status: "PENDING", hash: HASH }),
+      getTransaction: () => ({ status: rpc.Api.GetTransactionStatus.SUCCESS, ledger: 42 }),
+    });
+
+    const outcome = await invoke(
+      makeParams(server, { pollOptions: { pollAttempts: 1, pollIntervalMs: 0 } }),
+    );
+
+    assert.equal(outcome.kind, "allowed");
+    assert.equal(outcome.kind === "allowed" ? outcome.submission.hash : undefined, HASH);
+  });
+});
+
+// ── Malformed simulation fees are classified, not converted ─────────────────
+
+/**
+ * A malformed resource fee must fail the way every other malformed contract
+ * response fails: with the SDK's typed `ContractResponseError`, naming the
+ * field and the stage. A native `BigInt` conversion error says neither, and
+ * escapes the SDK's own classification.
+ */
+describe("invoke() malformed simulation resource fee", () => {
+  function enforcedWithFee(minResourceFee: unknown) {
+    return {
+      ...(probeSuccess() as Record<string, unknown>),
+      minResourceFee,
+    };
+  }
+
+  it("reports a malformed enforced-simulation fee as a typed contract-response error", async () => {
+    for (const value of [undefined, null, "", "not-a-fee", "1.5", -1, 2n ** 64n]) {
+      const server = createMockServer({ enforced: () => enforcedWithFee(value) });
+
+      const outcome = await invoke(makeParams(server));
+
+      assert.equal(outcome.kind, "error");
+      assert.ok(
+        outcome.error instanceof ContractResponseError,
+        `expected a ContractResponseError for ${String(value)}`,
+      );
+      assert.equal(outcome.error.field, "minResourceFee");
+      assert.equal(outcome.error.stage, "assemble");
+      assert.match(outcome.kind === "error" ? (outcome.detail ?? "") : "", /assembly failed/);
+      assert.equal(server.sendCount, 0, "a malformed fee must stop the pipeline before the broadcast");
+    }
+  });
+
+  it("accepts the fee in every representation the SDK may hand back", async () => {
+    for (const value of ["42", 42, 42n]) {
+      const server = createMockServer({ enforced: () => enforcedWithFee(value) });
+
+      const outcome = await invoke(
+        makeParams(server, { pollOptions: { pollAttempts: 1, pollIntervalMs: 0 } }),
+      );
+
+      assert.equal(outcome.kind, "allowed");
+    }
+  });
+
+  it("reports a malformed fee in a dry run as undetermined, never admissible", async () => {
+    const server = createMockServer({ enforced: () => enforcedWithFee("not-a-fee") });
+
+    const outcome = await invoke(makeParams(server, { dryRun: true }));
+
+    assert.equal(outcome.kind, "dry_run");
+    if (outcome.kind !== "dry_run") throw new Error("unreachable");
+    assert.equal(outcome.admissible, false);
+    assert.equal(outcome.verdict, "undetermined");
+    assert.ok(outcome.error instanceof ContractResponseError);
+    assert.equal(outcome.error.field, "minResourceFee");
+    assert.equal(outcome.error.stage, "simulate");
     assert.equal(outcome.fees.totalFeeStroops, 0n);
   });
 });

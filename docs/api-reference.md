@@ -18,6 +18,9 @@ The Stellar Agent Guard SDK exposes the following public surface. For the narrat
   - `check(call: ContractCall): Promise<CostPreCheckResult>` — Returns `within_budget | over_budget | blocked | undetermined`.
   - `checkWithCost(call: ContractCall): Promise<{ decision, cost }>` — Returns the interceptor verdict and the cost of the **same** single simulation. Prefer this over calling `check()` on both classes.
 - `invoke(options: InvokeOptions): Promise<InvokeResult>` — End-to-end pipeline: probe, sign auth, simulate, and broadcast. Accepts an optional `onStep(step: InvokeStepEvent)` hook reporting per-stage `start`/`ok`/`fail` timing events with a 0-based retry `attempt` index; callback exceptions are isolated and omitting the hook changes nothing.
+- `invoke(options)` / `invoke({ ...options, dryRun: true })` — Broadcasts an admissible result, or returns the full pre-broadcast dry-run trace.
+- `invoke({ ...options, onSubmitted })` — An optional `onSubmitted(event: SubmissionAcceptedEvent)` hook, called once as soon as the network accepts the broadcast and **before** any confirmation polling, carrying the transaction hash (`hash: null` when the broadcast response named no transaction — that submission fails closed). Every outcome that happened after a broadcast carries the same hash as `transactionHash`, so a failed poll or a spent deadline never costs the caller its recovery handle. See [the invoke pipeline](api/invoke-pipeline.md#the-transaction-hash-as-soon-as-the-server-accepts-the-submission).
+- `submitSetPolicy(params)` / `submitFreeze(params)` / `submitUnfreeze(params)` / `submitRotateAgentKey(params)` — The administrative submissions (`set_policy`, `freeze`, `unfreeze`, `rotate_agent_key`), each running the full `invoke()` pipeline with the admin signer as the authorizer. Besides `server`, `guard`, `admin` and `source`, they accept `dryRun`, `pollAttempts`, `pollIntervalMs`, and — like a normal invocation — `signal` and `timeoutMs`. An already-aborted signal short-circuits before any RPC and returns the documented typed outcome (the `error` arm carrying an `RpcTimeoutError` with `aborted: true`); a fired per-call timeout is reported the same way. Neither option relaxes the administrative authorization behaviour.
 - `startHeartbeat(options): Promise<HeartbeatHandle>` — Drift-aware dead-man keep-alive. Fires `heartbeat()` on an interval, reports lateness (`handle.missedBeats`, `onBeat`'s `lateMs`), routes every failure to `onError`, validates `interval <= grace/3` before the first beat when the grace window is readable, and stops cleanly (`await handle.stop()`). `stop()` requests cancellation through the submission context and waits for the in-flight beat; `stop({ timeoutMs })` / `stopTimeoutMs` bound that wait and return `{ reason, settled, submission?, error? }`. A submission that outlives several cadence slots skips the stale slots instead of firing a catch-up burst. See “Keep the dead-man switch alive”.
 - `submitHeartbeat(params): Promise<HeartbeatSubmission>` — Signs and submits a single `heartbeat()` with the agent's guard authorization; the default submission `startHeartbeat` uses. Accepts an optional `signal` forwarded to the underlying `invoke()` pipeline.
 - `HeartbeatIntervalError` — Thrown before the first beat when the requested interval exceeds `grace / 3`.
@@ -86,7 +89,9 @@ source of truth, and it is what a `maxFeeStroops` ceiling is compared against.
 `formatFee()` renders the same number in XLM, the unit operators think in, using
 **integer math only** (XLM has 7 decimal places; float rounding on
 money-adjacent output in a security tool is not acceptable) and with no trailing
-zeros:
+zeros. Fees are non-negative: a negative `bigint` or signed string throws
+`TypeError` instead of rendering an impossible amount. A ceiling of `0n` is a
+real, maximally strict ceiling; only omitting `maxFeeStroops` disables the check.
 
 ```ts
 import { formatFee } from "stellar-agent-guard-sdk";
@@ -117,6 +122,10 @@ if (decision.kind === "within_budget" && decision.breakdown) {
 ```
 
 `breakdown` is `undefined` when the simulation is undetermined, malformed, or missing any required resource field; the SDK never fabricates zero values. The stellar-sdk v17 Soroban resource payload has no `memBytes` field, so this API reports the actual `writeBytes`/disk resource fields rather than relabeling them as memory usage.
+
+#### Ledger provenance
+
+Priced decisions carry `provenance: { ledger: number } | null`, read from the **same** simulation response that produced the quote. It identifies the ledger snapshot the quote describes; it is informational and is not a promise about where a transaction will land. When the simulation does not establish a usable ledger, provenance is `null` rather than a fabricated number. `blocked` and `undetermined` decisions always have `provenance: null`.
 
 #### One simulation per check: prefer `checkWithCost`
 
@@ -163,9 +172,8 @@ one-shot form.
 - `policyFromScVal(scVal)` — Alias for callers using the issue's original function name.
 - `policyToJson(policy)` / `policyFromJson(value)` — Versioned, lossless in-memory JSON shape. All integer fields are decimal strings, and parsing rejects numbers, unknown fields, invalid addresses, and values outside their `u64`/`i128` ranges with a `PolicyDecodeError` field path. `encodePolicyJson` / `decodePolicyJson` are equivalent aliases. This is a persistence/transport shape, not ScVal encoding.
 - `describePolicy(policy: PolicyConfig | null, options?: DescribePolicyOptions): string` — A compact, log-friendly rendering of the policy in force. See [Describing a policy](#describing-a-policy-issue-343).
-- `invoke(options)` / `invoke({ ...options, dryRun: true })` — Broadcasts an admissible result, or returns the full pre-broadcast dry-run trace.
 - `verifyAgentSignature(publicKey, payload, signature): boolean` — Verify-only Ed25519 check against a strkey or raw 32-byte key.
-- `GuardError`, `SimulationError`, `SigningError`, `BroadcastError`, `PolicyDecodeError`, and `ContractResponseError` — Typed failure hierarchy.
+- `GuardError`, `SimulationError`, `SigningError`, `BroadcastError`, `PolicyDecodeError`, and `ContractResponseError` — Typed operational failure hierarchy. Invalid input is separate: `InvalidInputError` and `InvalidFeeCeilingError` extend `TypeError`.
 - `decodeCheckResult(raw): CheckResult` — Decodes `Allowed` or `Blocked(reason)`.
 - `decodeAuthDecision(event: SorobanRpc.Api.GetEventsResponse.Event): AuthDecisionEvent | null`
 - `decodeGuardEventXdr(xdrBase64: string, source?: 'ledger' | 'diagnostic'): GuardAuthDecision | null` — Offline decode of a raw base64 event XDR. Accepts either a `DiagnosticEvent` (what `getEvents()` and a simulation error carry) or a `ContractEvent` (what a block explorer exposes) and returns the same decision the object-path decode produces. Malformed base64, an XDR that is not a contract event, and an event that is not an `event_auth_checked` decision all return `null` — it never throws, so fixture checks and operator copy-paste cannot crash a long-running process.
