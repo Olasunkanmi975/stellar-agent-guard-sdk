@@ -58,3 +58,83 @@ const local = keypairAgentSigner(Keypair.random()); // validated at construction
 validateAgentPublicKey(local.publicKey);             // returns the G… form
 validateAgentPublicKey(local.publicKey.slice(0, -1) + "A"); // throws SigningError
 ```
+
+## Operator Runbook: Agent Key Rotation and Recovery
+
+This runbook outlines the procedure for rotating the agent key of a custom account
+and recovering from rotation failures. Follow these steps to minimize downtime
+and ensure the guard's policy remains enforceable.
+
+### Pre-Rotation Checks
+
+1. **Verify current agent key**: Confirm the current agent key authorized in the
+   guard contract matches the key used by your integration.
+2. **Check guard policy**: Ensure the guard contract is not paused and that the
+   policy allows the rotation transaction (typically a policy update call).
+3. **Prepare new agent key**: Generate a new key pair (or use an existing key) and
+   record its public key. The SDK does not store secret keys; you must manage
+   the secret key securely outside the SDK.
+4. **Test connectivity**: Verify that the Soroban RPC endpoint is reachable and
+   that you can submit transactions with the current agent key.
+
+### Dry-Run
+
+Perform a dry-run to validate the rotation transaction without broadcasting:
+
+1. Use the SDK's `invoke()` with `dryRun: true` to simulate the policy update
+   that sets the new agent key.
+2. Inspect the returned simulation events to ensure the transaction would be
+   `admissible` (not blocked or undetermined).
+3. Confirm that the resource fee is within expected bounds.
+
+### Submission
+
+Submit the key rotation transaction:
+
+1. Invoke the guard contract's function to update the agent key (typically
+   `set_agents` or similar, depending on the contract's interface).
+2. Use the current agent key to sign the authorization entries for this
+   invocation.
+3. Submit the transaction via the SDK's `invoke()` function.
+
+### Post-Rotation Verification
+
+After submission, verify the rotation succeeded:
+
+1. **Check transaction status**: Ensure the transaction succeeded on the ledger
+   (not failed due to insufficient fees, etc.).
+2. **Verify new agent key**: Call the guard contract's `agents()` viewer (or
+   equivalent) to confirm the new agent key is now authorized.
+3. **Test a harmless operation**: Use the SDK to perform a read-only or
+   low-risk operation (e.g., `balance` call) to confirm the new agent key can
+   sign auth entries successfully.
+
+### Rollback and Recovery Limits
+
+If the rotation transaction fails or the new agent key does not work as expected:
+
+1. **Do not retry immediately**: A failed rotation may indicate a policy issue
+   or network problem. Investigate before retrying.
+2. **Rollback procedure**: If the guard contract supports it, submit a
+   transaction to restore the previous agent key using the same process.
+   Note: Some guard contracts may not allow reverting to a previous key; in
+   such cases, you must continue with the new key or follow the contract's
+   key management procedure.
+3. **Recovery limits**: The SDK does not enforce limits on rotation attempts,
+   but be aware of the guard contract's own limits (e.g., rate limits, nonce
+   requirements). Excessive failed attempts may temporarily lock the account
+   due to nonce increments or policy restrictions.
+4. **Operator intervention**: If repeated failures occur, consult the guard
+   contract's documentation or contact the contract deployer for assistance.
+
+### Important Security Notes
+
+- The SDK **never reads or stores secret keys**. Secret keys must be managed
+  by the caller and provided only when signing (via the `AgentSigner`
+  interface).
+- Always inject the signer safely: never hardcode secret keys in source code;
+  use environment variables, secret managers, or hardware security modules.
+- The SDK only uses the public key for verification and the `signDigest`
+  method for signing; it does not retain the secret key beyond the signing
+  operation.
+

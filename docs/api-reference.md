@@ -28,6 +28,10 @@ The Stellar Agent Guard SDK exposes the following public surface. For the narrat
 - `isRetryableHeartbeatFailure(error): boolean` — True only for the transport failures a bounded retry can plausibly fix: a `BroadcastError`, an `RpcTimeoutError`, a `SimulationError`. A policy refusal and an unclassifiable error are both `false` (issue #340).
 - `DEFAULT_HEARTBEAT_RETRY_OPTIONS` — The retry defaults: `maxAttempts: 1` (retries are opt-in), `baseDelayMs: 250`, `maxDelayMs: 5_000` (issue #340).
 
+#### Operator Runbooks
+
+See the [Agent Key Rotation and Recovery runbook](concepts/custom-account-signing.md#operator-runbook-agent-key-rotation-and-recovery) for procedures to rotate the agent key of a custom account and recover from rotation failures.
+
 #### Heartbeat input validation (issue #341)
 
 `startHeartbeat()` validates its inputs **before** the scheduler exists, so a misconfiguration can never reach the first beat — and never even reads the grace window from the chain. Each failure names the offending field:
@@ -170,7 +174,7 @@ one-shot form.
 - `policyToScVal(policy: PolicyConfig): xdr.ScVal` — Encodes a policy as the contract's canonical sorted ScVal struct.
 - `decodePolicy(scVal: xdr.ScVal): PolicyConfig` — Strictly decodes `policy()`/set-policy ScVal data, including Option/Vec and numeric normalization.
 - `policyFromScVal(scVal)` — Alias for callers using the issue's original function name.
-- `policyToJson(policy)` / `policyFromJson(value)` — Versioned, lossless in-memory JSON shape. All integer fields are decimal strings, and parsing rejects numbers, unknown fields, invalid addresses, and values outside their `u64`/`i128` ranges with a `PolicyDecodeError` field path. `encodePolicyJson` / `decodePolicyJson` are equivalent aliases. This is a persistence/transport shape, not ScVal encoding.
+- `policyToJson(policy)` / `policyFromJson(value)` — Versioned, lossless JSON shape for persistence and transport, not ScVal encoding. All integer fields are decimal strings; parsing rejects numbers, unknown fields, invalid addresses, and values outside their `u64`/`i128` ranges with a `PolicyDecodeError` field path. The top-level `version` is currently `1`, and the parser accepts only versions supported by this SDK; unknown versions fail closed at `policy.version`. Incompatible format changes will increment the version, so consumers should explicitly migrate stored payloads before parsing them with a version that does not support their existing format. `encodePolicyJson` / `decodePolicyJson` are equivalent aliases.
 - `describePolicy(policy: PolicyConfig | null, options?: DescribePolicyOptions): string` — A compact, log-friendly rendering of the policy in force. See [Describing a policy](#describing-a-policy-issue-343).
 - `verifyAgentSignature(publicKey, payload, signature): boolean` — Verify-only Ed25519 check against a strkey or raw 32-byte key.
 - `GuardError`, `SimulationError`, `SigningError`, `BroadcastError`, `PolicyDecodeError`, and `ContractResponseError` — Typed operational failure hierarchy. Invalid input is separate: `InvalidInputError` and `InvalidFeeCeilingError` extend `TypeError`.
